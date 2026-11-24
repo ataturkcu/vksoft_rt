@@ -35,3 +35,14 @@ uint f2o(float f) {
 float o2f(uint o) {
   return uintBitsToFloat((o & 0x80000000u) != 0u ? (o & 0x7FFFFFFFu) : ~o);
 }
+
+const uint AS_MAGIC = 0x42534B56u;  // 'VKSB'
+const uint INSTANCE_WORDS = 32u;
+
+uint64_t ld64(uint64_t base, uint i) { return uint64_t(ld(base, i)) | (uint64_t(ld(base, i + 1u)) << 32); }
+
+// Address of application instance i (VkAccelerationStructureInstanceKHR, 64 B), either a
+// packed array or an array of pointers.
+uint64_t instanceAddr(uint64_t base, uint ptrMode, uint i) {
+  return ptrMode != 0u ? ld64(base, i * 2u) : base + uint64_t(i) * 64ul;
+}

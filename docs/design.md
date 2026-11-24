@@ -127,8 +127,8 @@ bound): 100k triangles 3.2 ms, 1M triangles 25 ms. Correctness is checked on the
 set incl. ids/transforms, ties, block-edge sizes).
 
 Known limitations / decisions:
-- Only `R32G32B32_SFLOAT` triangles; AABB geometry, TLAS, host builds, copy/compact/
-  serialize are not implemented yet (M1.3+). `mode = UPDATE` is treated as a full rebuild
+- Only `R32G32B32_SFLOAT` triangles; AABB geometry, host builds, copy/compact/
+  serialize are not implemented yet. `mode = UPDATE` is treated as a full rebuild
   (always correct; refit-only update is an M3 optimisation).
 - Kernels assume subgroup size 32 (+ballot/arithmetic); the layer disables the builder
   otherwise (AMD/Intel need a generic path later).
@@ -143,6 +143,27 @@ Known limitations / decisions:
 - Refit finding: the second-arriving thread must read its sibling's box with atomics;
   plain/`coherent` loads returned stale data intermittently on NVIDIA. Atomics for all
   six words is correct but not free; revisit when optimising.
+
+#### TLAS build (M1.3, implemented)
+Same sort/tree pipeline as the BLAS, with instance-specific stages:
+`fetch_instances` reads the application's `VkAccelerationStructureInstanceKHR` array (or
+array of pointers), looks up the referenced BLAS header (checked via magic/type), transforms
+its bounds into a world-space box (Arvo) and writes a 24 B box record; `morton` then uses box
+centres. The final `refit` pass writes the **128 B TLAS leaf record** (layout in
+[bvh_format.h](../layer/src/bvh_format.h)): objectToWorld, a precomputed worldToObject
+(3x3 cofactor inverse; zeros for singular matrices), custom index/mask, SBT offset/flags,
+BLAS address, original instance index.
+
+Inactive instances (null or invalid BLAS reference, or an empty BLAS) stay in the tree as
+leaves with an *empty* box (min=+inf, max=-inf) and mask 0: empty boxes are the identity of
+the box union, so no special casing in the refit, and they sort to the end of the Morton
+order. The same trick will be used for NaN triangles.
+
+The BLAS must be built before the TLAS in submission order (the spec requires this anyway);
+the conservative barriers around each build make the BLAS header visible to the TLAS build.
+Measured (includes readback copy): 5k instances 0.8 ms, 200k instances 37 ms.
+`tests/tlas_build.cpp` verifies shape, tight world boxes, every instance exactly once, record
+fields, the inverse transform, inactive handling, pointer-array mode and Morton ties.
 
 ### 4.3 `ray_query`
 Rewrite SPIR-V: replace `OpRayQuery*` instructions with calls to a generated traversal
@@ -172,7 +193,7 @@ which images are outputs, so they are **research items**, off by default, per-ga
 | M  | Content | Validation |
 |----|---------|------------|
 | M0 | Layer skeleton, dispatch, ray_query advertisement | `vulkaninfo` shows ray_query *(done)* |
-| M1 | AS build/update/copy, own BVH; `ray_query` via SPIR-V rewrite (done: object model, sizes, triangle BLAS GPU build; next: TLAS/AABB, then traversal + SPIR-V rewrite) | Khronos ray-query samples, Vulkan CTS RT tests, Sponza |
+| M1 | AS build/update/copy, own BVH; `ray_query` via SPIR-V rewrite (done: object model, sizes, triangle BLAS and TLAS GPU builds; next: traversal + SPIR-V rewrite + descriptors; later AABB geometry, copy/compact) | Khronos ray-query samples, Vulkan CTS RT tests, Sponza |
 | M2 | RT pipeline megakernel | Quake II RTX, compare against driver emulation |
 | M3 | Performance: wide/quantized BVH, refit, async build, coherence | Frame-time benchmarks vs. M2 and vs. driver |
 | M4 | DXR games via vkd3d-proton / Proton | RT-required titles |
@@ -192,7 +213,7 @@ which images are outputs, so they are **research items**, off by default, per-ga
 ## 7. Developing
 
 Tests: `ctest --test-dir build --output-on-failure` (`bvh_sizes` is pure host code;
-`as_lifecycle` and `blas_build` run through the layer on the real GPU). Building needs
+`as_lifecycle`, `blas_build` and `tlas_build` run through the layer on the real GPU). Building needs
 `glslc` and Python 3.
 
 ```

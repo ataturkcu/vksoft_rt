@@ -1,0 +1,49 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+layout(local_size_x = 256) in;
+// World-space box of every TLAS instance. a0 instance array (or pointers), a1 box records
+// (6 floats, 24 B each), a2 centroid bounds (ordered uints); u0 count, u1 arrayOfPointers
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  uint lo[3] = uint[3](0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu);
+  uint hi[3] = uint[3](0u, 0u, 0u);
+  if (i < pc.u[0]) {
+    uint64_t inst = instanceAddr(pc.a[0], pc.u[1], i);
+    uint64_t ref = ld64(inst, 14u);
+    float mn[3] = float[3](uintBitsToFloat(0x7F800000u), uintBitsToFloat(0x7F800000u), uintBitsToFloat(0x7F800000u));
+    float mx[3] = float[3](uintBitsToFloat(0xFF800000u), uintBitsToFloat(0xFF800000u), uintBitsToFloat(0xFF800000u));
+    bool isActive = ref != 0ul && ld(ref, 0u) == AS_MAGIC && ld(ref, 1u) == 0u;
+    if (isActive) {
+      float bmn[3], bmx[3];
+      for (uint a = 0; a < 3; ++a) { bmn[a] = ldf(ref, 8u + a); bmx[a] = ldf(ref, 11u + a); }
+      isActive = bmn[0] <= bmx[0];
+      if (isActive) {
+        for (uint r = 0; r < 3; ++r) {  // Arvo: transform an AABB by an affine matrix
+          float tmn = ldf(inst, r * 4u + 3u), tmx = tmn;
+          for (uint c = 0; c < 3; ++c) {
+            float m = ldf(inst, r * 4u + c);
+            float a = m * bmn[c], b = m * bmx[c];
+            tmn += min(a, b);
+            tmx += max(a, b);
+          }
+          mn[r] = tmn;
+          mx[r] = tmx;
+        }
+        for (uint a = 0; a < 3; ++a) { lo[a] = f2o(0.5 * (mn[a] + mx[a])); hi[a] = lo[a]; }
+      }
+    }
+    for (uint a = 0; a < 3; ++a) {
+      stf(pc.a[1], i * 6u + a, mn[a]);
+      stf(pc.a[1], i * 6u + 3u + a, mx[a]);
+    }
+  }
+  for (uint a = 0; a < 3; ++a) {
+    uint mn = subgroupMin(lo[a]);
+    uint mx = subgroupMax(hi[a]);
+    if (subgroupElect()) {
+      atomicMin(Words(pc.a[2]).v[a], mn);
+      atomicMax(Words(pc.a[2]).v[3 + a], mx);
+    }
+  }
+}

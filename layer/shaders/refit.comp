@@ -4,20 +4,55 @@
 layout(local_size_x = 256) in;
 // Writes leaves in sorted order and computes node boxes bottom-up (second child to
 // arrive does the merge). a0 nodes, a1 dst prims, a2 src triangles, a3 sorted values,
-// a4 parent[], a5 flags[], a6 dst header; u0 = N
+// a4 parent[], a5 flags[], a6 dst header, a7 app instances (TLAS);
+// u0 = N, u1 = mode (0 triangles, 1 instances; a2 then holds 24 B box records), u2 = arrayOfPointers
 void main() {
   uint k = gl_GlobalInvocationID.x;
   uint n = pc.u[0];
   if (k >= n) return;
   uint src = ld(pc.a[3], k);
-  uint64_t tri = pc.a[2] + uint64_t(src) * uint64_t(TRI_BYTES);
-  uint64_t dst = pc.a[1] + uint64_t(k) * uint64_t(TRI_BYTES);
+  uint64_t dst = pc.a[1] + uint64_t(k) * uint64_t(pc.u[1] == 0u ? TRI_BYTES : INSTANCE_WORDS * 4u);
   float b[6];
-  for (uint w = 0; w < TRI_WORDS; ++w) st(dst, w, ld(tri, w));
-  for (uint a = 0; a < 3; ++a) {
-    float x = ldf(tri, a), y = ldf(tri, 3 + a), z = ldf(tri, 6 + a);
-    b[a] = min(x, min(y, z));
-    b[3 + a] = max(x, max(y, z));
+  if (pc.u[1] == 0u) {
+    uint64_t tri = pc.a[2] + uint64_t(src) * uint64_t(TRI_BYTES);
+    for (uint w = 0; w < TRI_WORDS; ++w) st(dst, w, ld(tri, w));
+    for (uint a = 0; a < 3; ++a) {
+      float x = ldf(tri, a), y = ldf(tri, 3 + a), z = ldf(tri, 6 + a);
+      b[a] = min(x, min(y, z));
+      b[3 + a] = max(x, max(y, z));
+    }
+  } else {
+    uint64_t rec = pc.a[2] + uint64_t(src) * 24ul;
+    for (uint w = 0; w < 6; ++w) b[w] = ldf(rec, w);
+    bool isActive = b[0] <= b[3];
+    uint64_t inst = instanceAddr(pc.a[7], pc.u[2], src);
+    float m[12];
+    for (uint w = 0; w < 12; ++w) m[w] = ldf(inst, w);
+    for (uint w = 0; w < 12; ++w) stf(dst, w, m[w]);
+    float c00 = m[5] * m[10] - m[6] * m[9];
+    float c01 = m[6] * m[8] - m[4] * m[10];
+    float c02 = m[4] * m[9] - m[5] * m[8];
+    float det = m[0] * c00 + m[1] * c01 + m[2] * c02;
+    float inv[12];
+    if (det != 0.0) {
+      float r = 1.0 / det;
+      inv[0] = c00 * r;  inv[1] = (m[2] * m[9] - m[1] * m[10]) * r;  inv[2] = (m[1] * m[6] - m[2] * m[5]) * r;
+      inv[4] = c01 * r;  inv[5] = (m[0] * m[10] - m[2] * m[8]) * r;  inv[6] = (m[2] * m[4] - m[0] * m[6]) * r;
+      inv[8] = c02 * r;  inv[9] = (m[1] * m[8] - m[0] * m[9]) * r;   inv[10] = (m[0] * m[5] - m[1] * m[4]) * r;
+      inv[3] = -(inv[0] * m[3] + inv[1] * m[7] + inv[2] * m[11]);
+      inv[7] = -(inv[4] * m[3] + inv[5] * m[7] + inv[6] * m[11]);
+      inv[11] = -(inv[8] * m[3] + inv[9] * m[7] + inv[10] * m[11]);
+    } else {
+      for (uint w = 0; w < 12; ++w) inv[w] = 0.0;
+    }
+    for (uint w = 0; w < 12; ++w) stf(dst, 12u + w, inv[w]);
+    uint w12 = ld(inst, 12u);
+    st(dst, 24u, isActive ? w12 : (w12 & 0x00FFFFFFu));  // inactive: mask 0
+    st(dst, 25u, ld(inst, 13u));
+    st(dst, 26u, isActive ? ld(inst, 14u) : 0u);
+    st(dst, 27u, isActive ? ld(inst, 15u) : 0u);
+    st(dst, 28u, src);
+    st(dst, 29u, 0u); st(dst, 30u, 0u); st(dst, 31u, 0u);
   }
   uint cur = LEAF_BIT | k;
   uint pidx = (n - 1u) + k;

@@ -23,13 +23,13 @@ namespace {
 using namespace bvh;
 
 enum Kernel {
-  K_INIT, K_HEADER, K_FETCH, K_MORTON, K_HIST, K_SCATTER, K_SCAN1, K_SCAN2, K_SCAN3,
+  K_INIT, K_HEADER, K_FETCH, K_FETCH_INST, K_MORTON, K_HIST, K_SCATTER, K_SCAN1, K_SCAN2, K_SCAN3,
   K_KARRAS, K_REFIT, K_COUNT
 };
 
 struct SpvRef { const uint32_t* data; size_t bytes; };
 #define SPV(n) SpvRef{k_##n##_spv, sizeof(k_##n##_spv)}
-const SpvRef kSpv[K_COUNT] = {SPV(init), SPV(header), SPV(fetch_tris), SPV(morton), SPV(radix_hist),
+const SpvRef kSpv[K_COUNT] = {SPV(init), SPV(header), SPV(fetch_tris), SPV(fetch_instances), SPV(morton), SPV(radix_hist),
                               SPV(radix_scatter), SPV(scan1), SPV(scan2), SPV(scan3), SPV(karras),
                               SPV(refit)};
 #undef SPV
@@ -154,24 +154,38 @@ constexpr uint32_t groups256(uint64_t n) { return static_cast<uint32_t>((n + 255
 bool recordBuild(BuildKernels* k, VkCommandBuffer cb, const VkAccelerationStructureBuildGeometryInfoKHR& info,
                  const VkAccelerationStructureBuildRangeInfoKHR* ranges, VkDeviceAddress dst) {
   if (!k) return false;
-  if (info.type != VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR) {
-    LOGF("build: TLAS not implemented yet");
+  const bool isTlas = info.type == VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
+  if (info.type != VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR && !isTlas) {
+    LOGF("build: unsupported acceleration structure type %d", int(info.type));
     return false;
   }
   // Validate before recording anything.
   uint64_t n = 0;
-  for (uint32_t g = 0; g < info.geometryCount; ++g) {
-    const auto& geo = info.pGeometries ? info.pGeometries[g] : *info.ppGeometries[g];
-    if (geo.geometryType != VK_GEOMETRY_TYPE_TRIANGLES_KHR) {
-      LOGF("build: only triangle geometry is implemented (geometry %u)", g);
+  if (isTlas) {
+    if (info.geometryCount != 1) {
+      LOGF("build: a TLAS needs exactly one instances geometry");
       return false;
     }
-    if (geo.geometry.triangles.vertexFormat != VK_FORMAT_R32G32B32_SFLOAT) {
-      LOGF("build: only R32G32B32_SFLOAT vertices are implemented (format %d)",
-           int(geo.geometry.triangles.vertexFormat));
+    const auto& geo = info.pGeometries ? info.pGeometries[0] : *info.ppGeometries[0];
+    if (geo.geometryType != VK_GEOMETRY_TYPE_INSTANCES_KHR) {
+      LOGF("build: TLAS geometry must be instances");
       return false;
     }
-    n += ranges[g].primitiveCount;
+    n = ranges[0].primitiveCount;
+  } else {
+    for (uint32_t g = 0; g < info.geometryCount; ++g) {
+      const auto& geo = info.pGeometries ? info.pGeometries[g] : *info.ppGeometries[g];
+      if (geo.geometryType != VK_GEOMETRY_TYPE_TRIANGLES_KHR) {
+        LOGF("build: only triangle geometry is implemented (geometry %u)", g);
+        return false;
+      }
+      if (geo.geometry.triangles.vertexFormat != VK_FORMAT_R32G32B32_SFLOAT) {
+        LOGF("build: only R32G32B32_SFLOAT vertices are implemented (format %d)",
+             int(geo.geometry.triangles.vertexFormat));
+        return false;
+      }
+      n += ranges[g].primitiveCount;
+    }
   }
 
   const ScratchLayout L = scratchLayout(n);
@@ -196,34 +210,49 @@ bool recordBuild(BuildKernels* k, VkCommandBuffer cb, const VkAccelerationStruct
   pc.a[0] = dst;
   pc.u[0] = static_cast<uint32_t>(n);
   pc.u[1] = static_cast<uint32_t>(nodeRegion);
-  pc.u[2] = 0;
+  pc.u[2] = isTlas ? 1u : 0u;
   dispatch(k, cb, K_HEADER, pc, 1);
   computeBarrier(k, cb);
 
-  uint64_t primBase = 0;
-  for (uint32_t g = 0; g < info.geometryCount; ++g) {
-    const auto& geo = info.pGeometries ? info.pGeometries[g] : *info.ppGeometries[g];
-    const auto& tri = geo.geometry.triangles;
-    const auto& r = ranges[g];
+  VkDeviceAddress instAddr = 0;
+  uint32_t instPtrMode = 0;
+  if (isTlas) {
+    const auto& geo = info.pGeometries ? info.pGeometries[0] : *info.ppGeometries[0];
+    instAddr = geo.geometry.instances.data.deviceAddress + ranges[0].primitiveOffset;
+    instPtrMode = geo.geometry.instances.arrayOfPointers ? 1u : 0u;
     pc = {};
-    const bool indexed = tri.indexType != VK_INDEX_TYPE_NONE_KHR;
-    if (indexed) {
-      pc.a[0] = tri.vertexData.deviceAddress;
-      pc.a[1] = tri.indexData.deviceAddress + r.primitiveOffset;
-      pc.u[5] = r.firstVertex;
-    } else {
-      pc.a[0] = tri.vertexData.deviceAddress + r.primitiveOffset + uint64_t(r.firstVertex) * tri.vertexStride;
+    pc.a[0] = instAddr;
+    pc.a[1] = scratch + L.tris;
+    pc.a[2] = scratch + L.bounds;
+    pc.u[0] = static_cast<uint32_t>(n);
+    pc.u[1] = instPtrMode;
+    dispatch(k, cb, K_FETCH_INST, pc, groups256(n));
+  } else {
+    uint64_t primBase = 0;
+    for (uint32_t g = 0; g < info.geometryCount; ++g) {
+      const auto& geo = info.pGeometries ? info.pGeometries[g] : *info.ppGeometries[g];
+      const auto& tri = geo.geometry.triangles;
+      const auto& r = ranges[g];
+      pc = {};
+      const bool indexed = tri.indexType != VK_INDEX_TYPE_NONE_KHR;
+      if (indexed) {
+        pc.a[0] = tri.vertexData.deviceAddress;
+        pc.a[1] = tri.indexData.deviceAddress + r.primitiveOffset;
+        pc.u[5] = r.firstVertex;
+      } else {
+        pc.a[0] = tri.vertexData.deviceAddress + r.primitiveOffset + uint64_t(r.firstVertex) * tri.vertexStride;
+      }
+      pc.a[2] = tri.transformData.deviceAddress ? tri.transformData.deviceAddress + r.transformOffset : 0;
+      pc.a[3] = scratch + L.tris + primBase * kTriangleScratchBytes;
+      pc.a[4] = scratch + L.bounds;
+      pc.u[0] = r.primitiveCount;
+      pc.u[1] = static_cast<uint32_t>(tri.vertexStride);
+      pc.u[2] = !indexed ? 0 : (tri.indexType == VK_INDEX_TYPE_UINT16 ? 1 : 2);
+      pc.u[3] = g;
+      pc.u[4] = (geo.flags & VK_GEOMETRY_OPAQUE_BIT_KHR) ? 1u : 0u;
+      dispatch(k, cb, K_FETCH, pc, groups256(r.primitiveCount));
+      primBase += r.primitiveCount;
     }
-    pc.a[2] = tri.transformData.deviceAddress ? tri.transformData.deviceAddress + r.transformOffset : 0;
-    pc.a[3] = scratch + L.tris + primBase * kTriangleScratchBytes;
-    pc.a[4] = scratch + L.bounds;
-    pc.u[0] = r.primitiveCount;
-    pc.u[1] = static_cast<uint32_t>(tri.vertexStride);
-    pc.u[2] = !indexed ? 0 : (tri.indexType == VK_INDEX_TYPE_UINT16 ? 1 : 2);
-    pc.u[3] = g;
-    pc.u[4] = (geo.flags & VK_GEOMETRY_OPAQUE_BIT_KHR) ? 1u : 0u;
-    dispatch(k, cb, K_FETCH, pc, groups256(r.primitiveCount));
-    primBase += r.primitiveCount;
   }
   computeBarrier(k, cb);
 
@@ -233,6 +262,7 @@ bool recordBuild(BuildKernels* k, VkCommandBuffer cb, const VkAccelerationStruct
   pc.a[2] = scratch + L.keysA;
   pc.a[3] = scratch + L.valsA;
   pc.u[0] = static_cast<uint32_t>(n);
+  pc.u[1] = isTlas ? 1u : 0u;
   dispatch(k, cb, K_MORTON, pc, groups256(n));
   computeBarrier(k, cb);
 
@@ -299,7 +329,10 @@ bool recordBuild(BuildKernels* k, VkCommandBuffer cb, const VkAccelerationStruct
   pc.a[4] = scratch + L.parent;
   pc.a[5] = scratch + L.flags;
   pc.a[6] = dst;
+  pc.a[7] = instAddr;
   pc.u[0] = static_cast<uint32_t>(n);
+  pc.u[1] = isTlas ? 1u : 0u;
+  pc.u[2] = instPtrMode;
   dispatch(k, cb, K_REFIT, pc, groups256(n));
 
   barrier(k, cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,

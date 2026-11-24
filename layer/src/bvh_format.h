@@ -17,7 +17,11 @@ constexpr uint64_t kHeaderBytes = 128;      // AS header: magic, type, counts, r
 constexpr uint64_t kNodeBytes = 64;         // wide (BVH4) node with quantized child boxes
 constexpr uint64_t kTrianglePrimBytes = 48; // 3 x vec3 + geometry/primitive ids
 constexpr uint64_t kAabbPrimBytes = 32;     // aabb + geometry/primitive ids
-constexpr uint64_t kInstanceBytes = 96;     // 3x4 transform + ids/mask/flags + BLAS address
+constexpr uint64_t kInstanceBytes = 128;    // TLAS leaf record, see below
+// TLAS instance record (32 words): [0..11] objectToWorld 3x4 row-major, [12..23]
+// worldToObject 3x4, [24] customIndex(24)|mask(8)<<24, [25] sbtOffset(24)|flags(8)<<24,
+// [26,27] BLAS address lo/hi (0 = inactive), [28] instance index, [29..31] reserved.
+// Inactive instances keep an empty box (min=+inf, max=-inf) and mask 0.
 
 // Scratch per primitive for a full build: morton keys + sort ping-pong + binary tree
 // (2N-1 nodes x 32 B) before collapse into wide nodes.

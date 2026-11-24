@@ -4,7 +4,7 @@ Software based ray tracing layer for Vulkan 1.2+ GPUs without dedicated RT cores
 
 Primary target: NVIDIA on Linux.
 
-Status: M0 done, M1 in progress (own acceleration structures; triangle BLAS GPU build works). See
+Status: M0 done, M1 in progress (own acceleration structures; triangle BLAS and TLAS GPU builds work). See
 [docs/design.md](docs/design.md).
 
 ```
