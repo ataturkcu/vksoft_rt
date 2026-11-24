@@ -108,7 +108,8 @@ void initVulkan(bool rayQuery = false) {
   CHECK(gQueueFamily != UINT32_MAX);
 
   const char* exts[] = {VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
-                        VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME, VK_KHR_RAY_QUERY_EXTENSION_NAME};
+                        VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME, VK_KHR_RAY_QUERY_EXTENSION_NAME,
+                        VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME};
   VkPhysicalDeviceRayQueryFeaturesKHR rqf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR};
   rqf.rayQuery = VK_TRUE;
   VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
@@ -127,7 +128,7 @@ void initVulkan(bool rayQuery = false) {
   dci.pNext = rayQuery ? static_cast<void*>(&rqf) : static_cast<void*>(&asf);  // shaderInt64 deliberately NOT enabled; the layer must force it
   dci.queueCreateInfoCount = 1;
   dci.pQueueCreateInfos = &qci;
-  dci.enabledExtensionCount = rayQuery ? 3 : 2;
+  dci.enabledExtensionCount = rayQuery ? 4 : 2;
   dci.ppEnabledExtensionNames = exts;
   VK(vkCreateDevice(gPd, &dci, nullptr, &gDev));
   vkGetDeviceQueue(gDev, gQueueFamily, 0, &gQueue);

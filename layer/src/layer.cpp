@@ -72,6 +72,12 @@ struct DeviceData {
   PFN_vkCreateDescriptorSetLayout CreateDescriptorSetLayout{};
   PFN_vkCreateDescriptorPool CreateDescriptorPool{};
   PFN_vkUpdateDescriptorSets UpdateDescriptorSets{};
+  PFN_vkCreateDescriptorUpdateTemplate CreateTemplate{};
+  PFN_vkDestroyDescriptorUpdateTemplate DestroyTemplate{};
+  PFN_vkUpdateDescriptorSetWithTemplate UpdateWithTemplate{};
+  PFN_vkCmdPushDescriptorSetKHR CmdPushDescriptorSet{};
+  PFN_vkCmdPushDescriptorSetWithTemplateKHR CmdPushDescriptorSetWithTemplate{};
+  PFN_vkGetDescriptorSetLayoutSupport GetDescriptorSetLayoutSupport{};
   vksoft::BuildKernels* kernels{};  // internal build pipelines (null if unavailable)
   vksoft::CellPool* cells{};        // TLAS address cells for rewritten descriptors
   bool asEnabled{false};            // app enabled VK_KHR_acceleration_structure
@@ -100,6 +106,18 @@ struct AsData {
 std::mutex gMutex;
 std::unordered_map<void*, InstanceData> gInstances;
 std::unordered_map<void*, DeviceData> gDevices;
+// Descriptor update templates containing acceleration structure entries. The template handed
+// to the application is the real driver template, created from translated entries: the AS
+// entries read VkDescriptorBufferInfo records appended after a copy of the application's
+// data blob (see hook_CreateDescriptorUpdateTemplate).
+struct TemplateInfo {
+  std::vector<VkDescriptorUpdateTemplateEntry> orig;
+  size_t extent{};      // bytes of the application's data blob covered by its entries
+  size_t extraBase{};   // offset of the translated region
+  size_t extraBytes{};
+  std::vector<size_t> translatedBase;  // per entry: offset of its translated records, or SIZE_MAX
+};
+std::unordered_map<uint64_t, TemplateInfo> gTemplates;
 std::unordered_map<VkCommandBuffer, CmdState> gCmd;
 std::unordered_map<uint64_t, AsData> gAccel;  // fake handle -> data
 uint64_t gNextAsHandle = 1;
@@ -339,6 +357,16 @@ VKAPI_ATTR VkResult VKAPI_CALL hook_CreateDevice(VkPhysicalDevice pd,
   d.CreateDescriptorSetLayout = reinterpret_cast<PFN_vkCreateDescriptorSetLayout>(nextGdpa(*pDevice, "vkCreateDescriptorSetLayout"));
   d.CreateDescriptorPool = reinterpret_cast<PFN_vkCreateDescriptorPool>(nextGdpa(*pDevice, "vkCreateDescriptorPool"));
   d.UpdateDescriptorSets = reinterpret_cast<PFN_vkUpdateDescriptorSets>(nextGdpa(*pDevice, "vkUpdateDescriptorSets"));
+  auto either = [&](const char* a, const char* b) -> PFN_vkVoidFunction {
+    PFN_vkVoidFunction f = nextGdpa(*pDevice, a);
+    return f ? f : nextGdpa(*pDevice, b);
+  };
+  d.CreateTemplate = reinterpret_cast<PFN_vkCreateDescriptorUpdateTemplate>(either("vkCreateDescriptorUpdateTemplate", "vkCreateDescriptorUpdateTemplateKHR"));
+  d.DestroyTemplate = reinterpret_cast<PFN_vkDestroyDescriptorUpdateTemplate>(either("vkDestroyDescriptorUpdateTemplate", "vkDestroyDescriptorUpdateTemplateKHR"));
+  d.UpdateWithTemplate = reinterpret_cast<PFN_vkUpdateDescriptorSetWithTemplate>(either("vkUpdateDescriptorSetWithTemplate", "vkUpdateDescriptorSetWithTemplateKHR"));
+  d.CmdPushDescriptorSet = reinterpret_cast<PFN_vkCmdPushDescriptorSetKHR>(either("vkCmdPushDescriptorSet", "vkCmdPushDescriptorSetKHR"));
+  d.CmdPushDescriptorSetWithTemplate = reinterpret_cast<PFN_vkCmdPushDescriptorSetWithTemplateKHR>(either("vkCmdPushDescriptorSetWithTemplate", "vkCmdPushDescriptorSetWithTemplateKHR"));
+  d.GetDescriptorSetLayoutSupport = reinterpret_cast<PFN_vkGetDescriptorSetLayoutSupport>(either("vkGetDescriptorSetLayoutSupport", "vkGetDescriptorSetLayoutSupportKHR"));
   d.asEnabled = wantsAs;
   if (wantsAs && d.GetBufferDeviceAddress) {
     d.kernels = vksoft::createBuildKernels(inst->instance, pd, *pDevice, nextGipa, nextGdpa);
@@ -632,6 +660,48 @@ VKAPI_ATTR VkResult VKAPI_CALL hook_CreateDescriptorPool(VkDevice device, const 
   return next(device, &patched, alloc, pPool);
 }
 
+// Fills the buffer range (address cell) standing in for acceleration structure `handle`.
+void asDescriptorInfo(vksoft::CellPool* cells, uint64_t handle, VkDescriptorBufferInfo* out) {
+  uint64_t addr = 0;
+  if (handle) {
+    std::lock_guard lock(gMutex);
+    auto it = gAccel.find(handle);
+    if (it != gAccel.end()) addr = it->second.address;
+  }
+  if (!vksoft::cellInfo(cells, handle, addr, out)) {
+    std::fprintf(stderr, "[vksoft_rt] acceleration structure cell pool exhausted\n");
+    vksoft::cellInfo(cells, 0, 0, out);
+  }
+}
+
+bool hasAsWrite(uint32_t count, const VkWriteDescriptorSet* w) {
+  for (uint32_t i = 0; i < count; ++i)
+    if (w[i].descriptorType == VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR) return true;
+  return false;
+}
+
+// Turns acceleration structure writes into storage buffer writes over address cells.
+// `infos` owns the buffer info arrays referenced by the returned writes.
+std::vector<VkWriteDescriptorSet> convertWrites(vksoft::CellPool* cells, uint32_t count, const VkWriteDescriptorSet* in,
+                                                std::vector<std::vector<VkDescriptorBufferInfo>>& infos) {
+  std::vector<VkWriteDescriptorSet> writes(in, in + count);
+  infos.assign(count, {});
+  for (uint32_t i = 0; i < count; ++i) {
+    if (writes[i].descriptorType != VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR) continue;
+    const VkWriteDescriptorSetAccelerationStructureKHR* as = nullptr;
+    for (auto* n = reinterpret_cast<const VkBaseInStructure*>(writes[i].pNext); n; n = n->pNext)
+      if (n->sType == VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR)
+        as = reinterpret_cast<const VkWriteDescriptorSetAccelerationStructureKHR*>(n);
+    infos[i].resize(writes[i].descriptorCount);
+    for (uint32_t j = 0; j < writes[i].descriptorCount; ++j)
+      asDescriptorInfo(cells, as ? reinterpret_cast<uint64_t>(as->pAccelerationStructures[j]) : 0, &infos[i][j]);
+    writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[i].pNext = nullptr;
+    writes[i].pBufferInfo = infos[i].data();
+  }
+  return writes;
+}
+
 VKAPI_ATTR void VKAPI_CALL hook_UpdateDescriptorSets(VkDevice device, uint32_t writeCount, const VkWriteDescriptorSet* pWrites,
                                                      uint32_t copyCount, const VkCopyDescriptorSet* pCopies) {
   PFN_vkUpdateDescriptorSets next;
@@ -642,38 +712,175 @@ VKAPI_ATTR void VKAPI_CALL hook_UpdateDescriptorSets(VkDevice device, uint32_t w
     next = dd.UpdateDescriptorSets;
     cells = dd.cells;
   }
-  bool any = false;
-  for (uint32_t i = 0; i < writeCount; ++i)
-    if (pWrites[i].descriptorType == VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR) any = true;
-  if (!any || !cells) return next(device, writeCount, pWrites, copyCount, pCopies);
-
-  std::vector<VkWriteDescriptorSet> writes(pWrites, pWrites + writeCount);
-  std::vector<std::vector<VkDescriptorBufferInfo>> infos(writeCount);
-  for (uint32_t i = 0; i < writeCount; ++i) {
-    if (writes[i].descriptorType != VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR) continue;
-    const VkWriteDescriptorSetAccelerationStructureKHR* as = nullptr;
-    for (auto* n = reinterpret_cast<const VkBaseInStructure*>(writes[i].pNext); n; n = n->pNext)
-      if (n->sType == VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR)
-        as = reinterpret_cast<const VkWriteDescriptorSetAccelerationStructureKHR*>(n);
-    infos[i].resize(writes[i].descriptorCount);
-    for (uint32_t j = 0; j < writes[i].descriptorCount; ++j) {
-      uint64_t key = as ? reinterpret_cast<uint64_t>(as->pAccelerationStructures[j]) : 0;
-      uint64_t addr = 0;
-      if (key) {
-        std::lock_guard lock(gMutex);
-        auto it = gAccel.find(key);
-        if (it != gAccel.end()) addr = it->second.address;
-      }
-      if (!vksoft::cellInfo(cells, key, addr, &infos[i][j])) {
-        std::fprintf(stderr, "[vksoft_rt] acceleration structure cell pool exhausted\n");
-        vksoft::cellInfo(cells, 0, 0, &infos[i][j]);
-      }
-    }
-    writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    writes[i].pNext = nullptr;
-    writes[i].pBufferInfo = infos[i].data();
-  }
+  if (!cells || !hasAsWrite(writeCount, pWrites)) return next(device, writeCount, pWrites, copyCount, pCopies);
+  std::vector<std::vector<VkDescriptorBufferInfo>> infos;
+  auto writes = convertWrites(cells, writeCount, pWrites, infos);
   next(device, writeCount, writes.data(), copyCount, pCopies);
+}
+
+VKAPI_ATTR void VKAPI_CALL hook_CmdPushDescriptorSet(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout layout,
+                                                     uint32_t set, uint32_t writeCount, const VkWriteDescriptorSet* pWrites) {
+  PFN_vkCmdPushDescriptorSetKHR next;
+  vksoft::CellPool* cells;
+  {
+    std::lock_guard lock(gMutex);
+    DeviceData& dd = gDevices[dispatchKey(cb)];
+    next = dd.CmdPushDescriptorSet;
+    cells = dd.cells;
+  }
+  if (!cells || !hasAsWrite(writeCount, pWrites)) return next(cb, bp, layout, set, writeCount, pWrites);
+  std::vector<std::vector<VkDescriptorBufferInfo>> infos;
+  auto writes = convertWrites(cells, writeCount, pWrites, infos);
+  next(cb, bp, layout, set, writeCount, writes.data());
+}
+
+// ---- descriptor update templates -----------------------------------------------------------
+
+size_t templateElementBytes(VkDescriptorType t) {
+  switch (t) {
+    case VK_DESCRIPTOR_TYPE_SAMPLER:
+    case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+    case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+    case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+    case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT: return sizeof(VkDescriptorImageInfo);
+    case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+    case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER: return sizeof(VkBufferView);
+    case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR: return sizeof(VkAccelerationStructureKHR);
+    case VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK: return 1;
+    default: return sizeof(VkDescriptorBufferInfo);
+  }
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL hook_CreateDescriptorUpdateTemplate(VkDevice device, const VkDescriptorUpdateTemplateCreateInfo* ci,
+                                                                   const VkAllocationCallbacks* alloc,
+                                                                   VkDescriptorUpdateTemplate* pTemplate) {
+  PFN_vkCreateDescriptorUpdateTemplate next;
+  {
+    std::lock_guard lock(gMutex);
+    next = gDevices[dispatchKey(device)].CreateTemplate;
+  }
+  bool any = false;
+  for (uint32_t i = 0; i < ci->descriptorUpdateEntryCount; ++i)
+    if (ci->pDescriptorUpdateEntries[i].descriptorType == VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR) any = true;
+  if (!any) return next(device, ci, alloc, pTemplate);
+
+  TemplateInfo info;
+  info.orig.assign(ci->pDescriptorUpdateEntries, ci->pDescriptorUpdateEntries + ci->descriptorUpdateEntryCount);
+  for (auto& e : info.orig) {
+    size_t last = e.offset + (e.descriptorCount ? (e.descriptorCount - 1) * e.stride : 0) +
+                  (e.descriptorType == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK ? e.descriptorCount : templateElementBytes(e.descriptorType));
+    info.extent = std::max(info.extent, last);
+  }
+  info.extraBase = (info.extent + 7) / 8 * 8;
+  std::vector<VkDescriptorUpdateTemplateEntry> entries = info.orig;
+  info.translatedBase.assign(entries.size(), SIZE_MAX);
+  size_t running = 0;
+  for (size_t i = 0; i < entries.size(); ++i) {
+    if (entries[i].descriptorType != VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR) continue;
+    info.translatedBase[i] = info.extraBase + running;
+    entries[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    entries[i].offset = info.extraBase + running;
+    entries[i].stride = sizeof(VkDescriptorBufferInfo);
+    running += size_t(entries[i].descriptorCount) * sizeof(VkDescriptorBufferInfo);
+  }
+  info.extraBytes = running;
+  VkDescriptorUpdateTemplateCreateInfo patched = *ci;
+  patched.pDescriptorUpdateEntries = entries.data();
+  VkResult res = next(device, &patched, alloc, pTemplate);
+  if (res == VK_SUCCESS) {
+    std::lock_guard lock(gMutex);
+    gTemplates[reinterpret_cast<uint64_t>(*pTemplate)] = std::move(info);
+  }
+  return res;
+}
+
+VKAPI_ATTR void VKAPI_CALL hook_DestroyDescriptorUpdateTemplate(VkDevice device, VkDescriptorUpdateTemplate tmpl,
+                                                                const VkAllocationCallbacks* alloc) {
+  PFN_vkDestroyDescriptorUpdateTemplate next;
+  {
+    std::lock_guard lock(gMutex);
+    next = gDevices[dispatchKey(device)].DestroyTemplate;
+    gTemplates.erase(reinterpret_cast<uint64_t>(tmpl));
+  }
+  next(device, tmpl, alloc);
+}
+
+// Builds the data blob the translated template reads: a copy of the application's data plus
+// the buffer infos standing in for its acceleration structure handles. Returns false if the
+// template has no acceleration structure entries.
+bool translateTemplateData(vksoft::CellPool* cells, VkDescriptorUpdateTemplate tmpl, const void* pData,
+                           std::vector<uint8_t>& blob) {
+  TemplateInfo info;
+  {
+    std::lock_guard lock(gMutex);
+    auto it = gTemplates.find(reinterpret_cast<uint64_t>(tmpl));
+    if (it == gTemplates.end()) return false;
+    info = it->second;
+  }
+  if (!cells) return false;
+  blob.assign(info.extraBase + info.extraBytes, 0);
+  std::memcpy(blob.data(), pData, info.extent);
+  for (size_t i = 0; i < info.orig.size(); ++i) {
+    if (info.translatedBase[i] == SIZE_MAX) continue;
+    const auto& e = info.orig[i];
+    for (uint32_t j = 0; j < e.descriptorCount; ++j) {
+      VkAccelerationStructureKHR h;
+      std::memcpy(&h, static_cast<const uint8_t*>(pData) + e.offset + size_t(j) * e.stride, sizeof(h));
+      VkDescriptorBufferInfo bi;
+      asDescriptorInfo(cells, reinterpret_cast<uint64_t>(h), &bi);
+      std::memcpy(blob.data() + info.translatedBase[i] + size_t(j) * sizeof(VkDescriptorBufferInfo), &bi, sizeof(bi));
+    }
+  }
+  return true;
+}
+
+VKAPI_ATTR void VKAPI_CALL hook_UpdateDescriptorSetWithTemplate(VkDevice device, VkDescriptorSet set,
+                                                                VkDescriptorUpdateTemplate tmpl, const void* pData) {
+  PFN_vkUpdateDescriptorSetWithTemplate next;
+  vksoft::CellPool* cells;
+  {
+    std::lock_guard lock(gMutex);
+    DeviceData& dd = gDevices[dispatchKey(device)];
+    next = dd.UpdateWithTemplate;
+    cells = dd.cells;
+  }
+  std::vector<uint8_t> blob;
+  if (translateTemplateData(cells, tmpl, pData, blob)) return next(device, set, tmpl, blob.data());
+  next(device, set, tmpl, pData);
+}
+
+VKAPI_ATTR void VKAPI_CALL hook_CmdPushDescriptorSetWithTemplate(VkCommandBuffer cb, VkDescriptorUpdateTemplate tmpl,
+                                                                 VkPipelineLayout layout, uint32_t set, const void* pData) {
+  PFN_vkCmdPushDescriptorSetWithTemplateKHR next;
+  vksoft::CellPool* cells;
+  {
+    std::lock_guard lock(gMutex);
+    DeviceData& dd = gDevices[dispatchKey(cb)];
+    next = dd.CmdPushDescriptorSetWithTemplate;
+    cells = dd.cells;
+  }
+  std::vector<uint8_t> blob;
+  if (translateTemplateData(cells, tmpl, pData, blob)) return next(cb, tmpl, layout, set, blob.data());
+  next(cb, tmpl, layout, set, pData);
+}
+
+VKAPI_ATTR void VKAPI_CALL hook_GetDescriptorSetLayoutSupport(VkDevice device, const VkDescriptorSetLayoutCreateInfo* ci,
+                                                              VkDescriptorSetLayoutSupport* pSupport) {
+  PFN_vkGetDescriptorSetLayoutSupport next;
+  {
+    std::lock_guard lock(gMutex);
+    next = gDevices[dispatchKey(device)].GetDescriptorSetLayoutSupport;
+  }
+  bool any = false;
+  for (uint32_t i = 0; i < ci->bindingCount; ++i)
+    if (ci->pBindings[i].descriptorType == VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR) any = true;
+  if (!any) return next(device, ci, pSupport);
+  std::vector<VkDescriptorSetLayoutBinding> b(ci->pBindings, ci->pBindings + ci->bindingCount);
+  for (auto& x : b)
+    if (x.descriptorType == VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR) x.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  VkDescriptorSetLayoutCreateInfo patched = *ci;
+  patched.pBindings = b.data();
+  next(device, &patched, pSupport);
 }
 
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL hook_GetDeviceProcAddr(VkDevice device, const char* name);
@@ -697,6 +904,18 @@ const Hook kTrackingHooks[] = {
     H(CreateDescriptorSetLayout),
     H(CreateDescriptorPool),
     H(UpdateDescriptorSets),
+    H(CreateDescriptorUpdateTemplate),
+    {"vkCreateDescriptorUpdateTemplateKHR", reinterpret_cast<PFN_vkVoidFunction>(hook_CreateDescriptorUpdateTemplate)},
+    H(DestroyDescriptorUpdateTemplate),
+    {"vkDestroyDescriptorUpdateTemplateKHR", reinterpret_cast<PFN_vkVoidFunction>(hook_DestroyDescriptorUpdateTemplate)},
+    H(UpdateDescriptorSetWithTemplate),
+    {"vkUpdateDescriptorSetWithTemplateKHR", reinterpret_cast<PFN_vkVoidFunction>(hook_UpdateDescriptorSetWithTemplate)},
+    {"vkCmdPushDescriptorSet", reinterpret_cast<PFN_vkVoidFunction>(hook_CmdPushDescriptorSet)},
+    {"vkCmdPushDescriptorSetKHR", reinterpret_cast<PFN_vkVoidFunction>(hook_CmdPushDescriptorSet)},
+    {"vkCmdPushDescriptorSetWithTemplate", reinterpret_cast<PFN_vkVoidFunction>(hook_CmdPushDescriptorSetWithTemplate)},
+    {"vkCmdPushDescriptorSetWithTemplateKHR", reinterpret_cast<PFN_vkVoidFunction>(hook_CmdPushDescriptorSetWithTemplate)},
+    H(GetDescriptorSetLayoutSupport),
+    {"vkGetDescriptorSetLayoutSupportKHR", reinterpret_cast<PFN_vkVoidFunction>(hook_GetDescriptorSetLayoutSupport)},
     H(CmdBindPipeline),
     H(CmdPushConstants),
     H(BeginCommandBuffer),

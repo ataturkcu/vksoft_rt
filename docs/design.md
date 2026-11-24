@@ -217,12 +217,19 @@ numeric ids), so no operand grammar tables are needed:
 **Descriptor side** ([layer/src/descriptor_cells.cpp](../layer/src/descriptor_cells.cpp)).
 `ACCELERATION_STRUCTURE_KHR` bindings become `STORAGE_BUFFER` in `vkCreateDescriptorSetLayout`
 and `vkCreateDescriptorPool`; `vkUpdateDescriptorSets` turns AS writes into buffer writes over a
-16-byte *address cell* (one per acceleration structure, 64k cells, released on destroy). Not
-yet covered: `vkUpdateDescriptorSetWithTemplate`, push descriptors, descriptor buffers.
+16-byte *address cell* (one per acceleration structure, 64k cells, released on destroy). The same
+conversion covers push descriptors (`vkCmdPushDescriptorSet[KHR]`), `vkGetDescriptorSetLayoutSupport`
+and **descriptor update templates**: the template handed to the application is the real driver
+template, created from translated entries; its AS entries read `VkDescriptorBufferInfo` records
+that the layer appends after a copy of the application's data blob at update time
+(`vkUpdateDescriptorSetWithTemplate`, `vkCmdPushDescriptorSetWithTemplate`). Not covered:
+`VK_EXT_descriptor_buffer` (`vkGetDescriptorEXT`) and `VK_EXT_mutable_descriptor_type` lists that
+name the acceleration structure type; both are needed to check against vkd3d-proton (M4).
 
 `tests/rq_test.cpp` runs an unmodified `GL_EXT_ray_query` GLSL shader (-O0 and -O builds)
 through all of this and checks it against the same brute-force reference in 9 flag/mask
-modes: all pass. `tests/test_rq_rewrite.cpp` validates rewritten modules with spirv-val.
+modes: all pass. Descriptors are delivered four ways (`vkUpdateDescriptorSets`, update
+template, push descriptors, push template), each checked against the reference. `tests/test_rq_rewrite.cpp` validates rewritten modules with spirv-val.
 
 **Speed of the ray_query path (first, unoptimised):** 4.5 Mrays/s closest-hit and 8.2
 Mrays/s terminate-on-first-hit (same 1M-triangle worst-case scene as trace_test, where the
@@ -233,7 +240,7 @@ traversal itself.
 
 ### 4.3c Open items of the ray query path
 Not implemented: procedural (AABB) candidates, `GenerateIntersection`, triangle vertex
-position fetch, descriptor templates and push descriptors, queries as function arguments.
+position fetch, descriptor buffers, queries as function arguments.
 
 ### 4.3d Ray tracing pipelines and vkd3d-proton
 Next milestones; see section 5.
