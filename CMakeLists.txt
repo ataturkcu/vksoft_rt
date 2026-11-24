@@ -33,9 +33,11 @@ if(VKSOFT_BUNDLE_SPIRV_TOOLS)
   FetchContent_Declare(spirv_tools GIT_REPOSITORY https://github.com/KhronosGroup/SPIRV-Tools.git
                        GIT_TAG v2026.4 GIT_SHALLOW TRUE)
   FetchContent_MakeAvailable(spirv_tools)
-  set(SPIRV_TOOLS SPIRV-Tools-static)
+  set(SPIRV_TOOLS SPIRV-Tools-opt SPIRV-Tools-static)
 else()
-  find_library(SPIRV_TOOLS SPIRV-Tools REQUIRED)
+  find_library(SPIRV_TOOLS_CORE SPIRV-Tools REQUIRED)
+  find_library(SPIRV_TOOLS_OPT SPIRV-Tools-opt REQUIRED)
+  set(SPIRV_TOOLS ${SPIRV_TOOLS_OPT} ${SPIRV_TOOLS_CORE})
 endif()
 
 # --- compute kernels: GLSL -> SPIR-V -> embedded C++ arrays ----------------------

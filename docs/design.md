@@ -254,6 +254,18 @@ traversal itself.
   turned up (zero direction vectors for "axis aligned" rays, which the reference silently
   treated as misses): fixed, real axis-aligned rays are now tested.
 
+### 4.3b3 First real game result and the first optimisation
+Quake II RTX through Steam with `ray_tracing_api query` (our layer): **7 fps at 720p**, against
+~30 fps for the driver's own emulation (`ray_tracing_api pipeline`): 4x slower. The game's own
+profiler (`profiler 1`) tells which of AS builds (`BVH_UPDATE`) or the tracing passes dominate;
+numbers requested.
+
+Optimisation 1 (measured with `rq_test`'s throughput run, same scene): the merged module is
+now run through the SPIRV-Tools performance passes (`Optimizer::RegisterPerformancePasses`; the
+library is compiled -O0, so the module was entirely unoptimised). ray_query closest-hit went
+from ~3.9 to ~7.7 Mrays/s (direct traversal: 10.4), terminate-on-first-hit from 7.6 to 11.0
+(direct: 16.1). `VKSOFT_RT_NO_OPT=1` disables it for A/B comparisons.
+
 ### 4.3c Open items of the ray query path
 Not implemented: triangle vertex position fetch, descriptor buffers, dynamic (non-constant)
 indexing of acceleration structure arrays with `NonUniform`, queries as function arguments.

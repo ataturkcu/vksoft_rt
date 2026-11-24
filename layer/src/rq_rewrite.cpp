@@ -1,9 +1,12 @@
 #include "rq_rewrite.h"
 
 #include <spirv-tools/libspirv.hpp>
+#include <spirv-tools/optimizer.hpp>
 
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <set>
@@ -607,6 +610,19 @@ bool Rewriter::run(const uint32_t* code, size_t words, std::vector<uint32_t>& ou
   if (!tools.Assemble(text, &bin, SPV_TEXT_TO_BINARY_OPTION_NONE)) return fail("assembling the rewritten module failed");
   const uint32_t version = std::max<uint32_t>(appVersion, 0x00010500u);
   bin[1] = version;
+  // The library is compiled -O0 (see CMake), so the merged module is unoptimised: inline the
+  // library functions, promote the by-pointer temporaries and private state to registers.
+  if (!std::getenv("VKSOFT_RT_NO_OPT")) {
+    spvtools::Optimizer opt(version >= 0x00010600u ? SPV_ENV_VULKAN_1_3 : SPV_ENV_VULKAN_1_2);
+    std::string optMsg;
+    opt.SetMessageConsumer([&](spv_message_level_t, const char*, const spv_position_t&, const char* m) {
+      if (optMsg.empty()) optMsg = m;
+    });
+    opt.RegisterPerformancePasses();
+    std::vector<uint32_t> optimized;
+    if (opt.Run(bin.data(), bin.size(), &optimized)) bin = std::move(optimized);
+    else if (std::getenv("VKSOFT_RT_LOG")) std::fprintf(stderr, "[vksoft_rt] optimizer failed (%s), keeping the unoptimised module\n", optMsg.c_str());
+  }
   if (validate) {
     spvtools::SpirvTools vt(version >= 0x00010600u ? SPV_ENV_VULKAN_1_3 : SPV_ENV_VULKAN_1_2);
     std::string msg;
