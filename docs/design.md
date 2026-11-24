@@ -27,6 +27,19 @@ The NVIDIA driver already emulates the pipeline path on this GPU. `ray_query` is
 so any game that requires it cannot start. The driver's BVH format is opaque, so a
 `ray_query` implementation of ours cannot traverse driver-built acceleration structures.
 
+### Performance baseline (driver emulation, no layer)
+
+Quake II RTX, GTX 1660 Ti, Linux, measured by the project owner:
+
+| Resolution | FPS  |
+|------------|------|
+| 1080p      | ~13  |
+| 900p       | ~20  |
+| 720p       | ~30  |
+
+FPS scales almost linearly with pixel count, i.e. with **ray count**. This is the number
+M2/M3 must beat, measured with identical settings and scene.
+
 ## 3. Core decision *(decided)*: own acceleration structures, single BVH
 
 The layer intercepts all `VK_KHR_acceleration_structure` build/copy/query commands and
@@ -75,6 +88,24 @@ calling the real `vkCreateDevice`. Advertising only happens if the driver expose
   (BVH over N primitives has bounded node count), so the app's allocations suffice.
 - Build work should be schedulable on an async compute queue when available.
 
+#### Object model (implemented in M1.1)
+- `VkAccelerationStructureKHR` handles are **fake**, owned by the layer (tagged 64-bit
+  ids); the driver never sees them. Every consumer of those handles must therefore be
+  intercepted: build/copy/serialize commands (currently logged no-ops), and — still to do —
+  `vkUpdateDescriptorSets` / descriptor set layouts / pools for
+  `VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR`, which will be rewritten into a
+  storage-buffer descriptor over the AS' backing buffer (rewritten SPIR-V reads the BVH
+  through it; BLAS references use buffer device addresses, which is why Vulkan 1.2
+  `bufferDeviceAddress` is the baseline).
+- `vkGetAccelerationStructureDeviceAddressKHR` = backing buffer address + offset.
+- `vkGetAccelerationStructureBuildSizesKHR` returns conservative upper bounds from
+  [layer/src/bvh_format.h](../layer/src/bvh_format.h) (unit-tested).
+- Open: vkd3d-proton may build AS descriptors from raw GPU addresses instead of handles;
+  to be checked before M4.
+- The layer still enables the driver's own `acceleration_structure` extension on the real
+  device (harmless; keeps the feature chain valid). Dropping that dependency is needed for
+  other vendors later.
+
 ### 4.3 `ray_query`
 Rewrite SPIR-V: replace `OpRayQuery*` instructions with calls to a generated traversal
 function plus per-query state (SPIR-V rewriting via SPIRV-Tools passes). Traversal
@@ -103,7 +134,7 @@ which images are outputs, so they are **research items**, off by default, per-ga
 | M  | Content | Validation |
 |----|---------|------------|
 | M0 | Layer skeleton, dispatch, ray_query advertisement | `vulkaninfo` shows ray_query *(done)* |
-| M1 | AS build/update/copy, own BVH; `ray_query` via SPIR-V rewrite | Khronos ray-query samples, Vulkan CTS RT tests, Sponza |
+| M1 | AS build/update/copy, own BVH; `ray_query` via SPIR-V rewrite (M1.1 object model + sizes: done; next: GPU build) | Khronos ray-query samples, Vulkan CTS RT tests, Sponza |
 | M2 | RT pipeline megakernel | Quake II RTX, compare against driver emulation |
 | M3 | Performance: wide/quantized BVH, refit, async build, coherence | Frame-time benchmarks vs. M2 and vs. driver |
 | M4 | DXR games via vkd3d-proton / Proton | RT-required titles |
@@ -121,6 +152,9 @@ which images are outputs, so they are **research items**, off by default, per-ga
   explicit-only (`VK_LOADER_LAYERS_ENABLE=VK_LAYER_VKSOFT_rt`), never an implicit layer.
 
 ## 7. Developing
+
+Tests: `ctest --test-dir build --output-on-failure` (`bvh_sizes` is pure host code;
+`as_lifecycle` runs through the layer on the real GPU).
 
 ```
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release

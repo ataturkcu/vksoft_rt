@@ -24,3 +24,19 @@ target_link_options(VkLayer_vksoft_rt PRIVATE -Wl,--no-undefined)
 # Layer manifest next to the library so VK_ADD_LAYER_PATH=<build dir> works.
 configure_file(layer/VkLayer_vksoft_rt.json.in
                ${CMAKE_BINARY_DIR}/VkLayer_vksoft_rt.json @ONLY)
+
+# --- tests -------------------------------------------------------------------
+enable_testing()
+
+add_executable(test_bvh_sizes tests/test_bvh_sizes.cpp)
+add_test(NAME bvh_sizes COMMAND test_bvh_sizes)
+
+# GPU integration test: needs a Vulkan driver with acceleration structures.
+find_library(VULKAN_LOADER vulkan)
+if(VULKAN_LOADER)
+  add_executable(as_lifecycle tests/as_lifecycle.cpp)
+  target_link_libraries(as_lifecycle PRIVATE Vulkan::Headers ${VULKAN_LOADER})
+  add_test(NAME as_lifecycle COMMAND as_lifecycle)
+  set_tests_properties(as_lifecycle PROPERTIES
+    ENVIRONMENT "VK_ADD_LAYER_PATH=${CMAKE_BINARY_DIR};VK_LOADER_LAYERS_ENABLE=VK_LAYER_VKSOFT_rt;VKSOFT_RT_LOG=1")
+endif()

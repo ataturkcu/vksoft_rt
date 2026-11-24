@@ -8,8 +8,11 @@
 #include <vulkan/vulkan.h>
 #include <vulkan/vk_layer.h>
 
+#include "bvh_format.h"
+
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
 #include <cstring>
 #include <mutex>
 #include <unordered_map>
@@ -56,12 +59,26 @@ struct DeviceData {
   VkDevice device{};
   PFN_vkGetDeviceProcAddr gdpa{};
   PFN_vkDestroyDevice DestroyDevice{};
+  PFN_vkGetBufferDeviceAddress GetBufferDeviceAddress{};
   bool rayQueryRequested{false};  // app asked for rayQuery (emulated by us)
+};
+
+// An acceleration structure is a layer-owned object: the handle is fake (the driver
+// never sees it) and the data lives in the buffer range the application provided.
+struct AsData {
+  VkBuffer buffer{};
+  VkDeviceSize offset{};
+  VkDeviceSize size{};
+  VkAccelerationStructureTypeKHR type{};
+  VkDeviceAddress address{};
 };
 
 std::mutex gMutex;
 std::unordered_map<void*, InstanceData> gInstances;
 std::unordered_map<void*, DeviceData> gDevices;
+std::unordered_map<uint64_t, AsData> gAccel;  // fake handle -> data
+uint64_t gNextAsHandle = 1;
+constexpr uint64_t kAsHandleTag = 0x5a53'0000'0000'0000ull;  // makes stray handles obvious
 
 InstanceData* instanceFor(void* key) {
   std::lock_guard lock(gMutex);
@@ -261,6 +278,11 @@ VKAPI_ATTR VkResult VKAPI_CALL hook_CreateDevice(VkPhysicalDevice pd,
   d.device = *pDevice;
   d.gdpa = nextGdpa;
   d.DestroyDevice = reinterpret_cast<PFN_vkDestroyDevice>(nextGdpa(*pDevice, "vkDestroyDevice"));
+  d.GetBufferDeviceAddress = reinterpret_cast<PFN_vkGetBufferDeviceAddress>(
+      nextGdpa(*pDevice, "vkGetBufferDeviceAddress"));
+  if (!d.GetBufferDeviceAddress)
+    d.GetBufferDeviceAddress = reinterpret_cast<PFN_vkGetBufferDeviceAddress>(
+        nextGdpa(*pDevice, "vkGetBufferDeviceAddressKHR"));
   d.rayQueryRequested = strip;
   {
     std::lock_guard lock(gMutex);
@@ -282,6 +304,87 @@ VKAPI_ATTR void VKAPI_CALL hook_DestroyDevice(VkDevice device,
   next(device, pAllocator);
 }
 
+
+// ---- acceleration structures (M1) ----------------------------------------
+
+VKAPI_ATTR VkResult VKAPI_CALL hook_CreateAccelerationStructureKHR(
+    VkDevice device, const VkAccelerationStructureCreateInfoKHR* ci, const VkAllocationCallbacks*,
+    VkAccelerationStructureKHR* pAs) {
+  if (ci->offset % vksoft::bvh::kAsAlignment != 0) return VK_ERROR_VALIDATION_FAILED_EXT;
+  PFN_vkGetBufferDeviceAddress getAddr;
+  {
+    std::lock_guard lock(gMutex);
+    auto it = gDevices.find(dispatchKey(device));
+    if (it == gDevices.end()) return VK_ERROR_INITIALIZATION_FAILED;
+    getAddr = it->second.GetBufferDeviceAddress;
+  }
+  if (!getAddr) return VK_ERROR_FEATURE_NOT_PRESENT;  // bufferDeviceAddress not enabled
+
+  VkBufferDeviceAddressInfo info{};
+  info.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
+  info.buffer = ci->buffer;
+  AsData as;
+  as.buffer = ci->buffer;
+  as.offset = ci->offset;
+  as.size = ci->size;
+  as.type = ci->type;
+  as.address = getAddr(device, &info) + ci->offset;
+
+  std::lock_guard lock(gMutex);
+  uint64_t handle = kAsHandleTag | gNextAsHandle++;
+  gAccel[handle] = as;
+  *pAs = reinterpret_cast<VkAccelerationStructureKHR>(handle);
+  LOG("AS created: type=%d size=%llu addr=0x%llx", int(as.type), (unsigned long long)as.size,
+      (unsigned long long)as.address);
+  return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL hook_DestroyAccelerationStructureKHR(VkDevice, VkAccelerationStructureKHR as,
+                                                                const VkAllocationCallbacks*) {
+  std::lock_guard lock(gMutex);
+  gAccel.erase(reinterpret_cast<uint64_t>(as));
+}
+
+VKAPI_ATTR VkDeviceAddress VKAPI_CALL hook_GetAccelerationStructureDeviceAddressKHR(
+    VkDevice, const VkAccelerationStructureDeviceAddressInfoKHR* info) {
+  std::lock_guard lock(gMutex);
+  auto it = gAccel.find(reinterpret_cast<uint64_t>(info->accelerationStructure));
+  return it == gAccel.end() ? 0 : it->second.address;
+}
+
+VKAPI_ATTR void VKAPI_CALL hook_GetAccelerationStructureBuildSizesKHR(
+    VkDevice, VkAccelerationStructureBuildTypeKHR, const VkAccelerationStructureBuildGeometryInfoKHR* b,
+    const uint32_t* pMaxPrimitiveCounts, VkAccelerationStructureBuildSizesInfoKHR* out) {
+  using namespace vksoft::bvh;
+  uint64_t n = 0;
+  uint64_t perPrim = kTrianglePrimBytes;
+  for (uint32_t i = 0; i < b->geometryCount; ++i) {
+    n += pMaxPrimitiveCounts[i];
+    const VkAccelerationStructureGeometryKHR& g = b->pGeometries ? b->pGeometries[i] : *b->ppGeometries[i];
+    uint64_t pb = g.geometryType == VK_GEOMETRY_TYPE_AABBS_KHR       ? kAabbPrimBytes
+                : g.geometryType == VK_GEOMETRY_TYPE_INSTANCES_KHR   ? kInstanceBytes
+                                                                     : kTrianglePrimBytes;
+    perPrim = (i == 0) ? pb : std::max(perPrim, pb);  // mixed kinds: bound by the largest
+  }
+  out->accelerationStructureSize = accelerationStructureSize(n, perPrim);
+  out->buildScratchSize = buildScratchSize(n);
+  out->updateScratchSize = updateScratchSize(n);
+}
+
+// Our handles must never reach the driver. Until the GPU build lands, commands that
+// consume them are no-ops (loudly logged) rather than crashes inside the driver.
+#define STUB_CMD(name)                                                        \
+  VKAPI_ATTR void VKAPI_CALL hook_##name(VkCommandBuffer, ...) {              \
+    LOG(#name ": not implemented yet (ignored)");                             \
+  }
+STUB_CMD(CmdBuildAccelerationStructuresKHR)
+STUB_CMD(CmdBuildAccelerationStructuresIndirectKHR)
+STUB_CMD(CmdCopyAccelerationStructureKHR)
+STUB_CMD(CmdCopyAccelerationStructureToMemoryKHR)
+STUB_CMD(CmdCopyMemoryToAccelerationStructureKHR)
+STUB_CMD(CmdWriteAccelerationStructuresPropertiesKHR)
+#undef STUB_CMD
+
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL hook_GetDeviceProcAddr(VkDevice device, const char* name);
 
 struct Hook {
@@ -300,6 +403,16 @@ const Hook kInstanceHooks[] = {
 const Hook kDeviceHooks[] = {
     H(DestroyDevice),
     H(GetDeviceProcAddr),
+    H(CreateAccelerationStructureKHR),
+    H(DestroyAccelerationStructureKHR),
+    H(GetAccelerationStructureDeviceAddressKHR),
+    H(GetAccelerationStructureBuildSizesKHR),
+    H(CmdBuildAccelerationStructuresKHR),
+    H(CmdBuildAccelerationStructuresIndirectKHR),
+    H(CmdCopyAccelerationStructureKHR),
+    H(CmdCopyAccelerationStructureToMemoryKHR),
+    H(CmdCopyMemoryToAccelerationStructureKHR),
+    H(CmdWriteAccelerationStructuresPropertiesKHR),
 };
 #undef H
 
@@ -322,6 +435,8 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL hook_GetInstanceProcAddr(VkInstance ins
     return reinterpret_cast<PFN_vkVoidFunction>(hook_CreateInstance);
   if (!instance) return nullptr;
   for (auto& h : kInstanceHooks)
+    if (std::strcmp(h.name, name) == 0) return h.fn;
+  for (auto& h : kDeviceHooks)  // apps may fetch device functions via the instance
     if (std::strcmp(h.name, name) == 0) return h.fn;
   PFN_vkGetInstanceProcAddr next;
   {
