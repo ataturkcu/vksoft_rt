@@ -20,6 +20,7 @@ FetchContent_MakeAvailable(vulkan_headers)
 find_program(GLSLC glslc REQUIRED)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 set(KERNELS init header fetch_tris fetch_instances morton radix_hist radix_scatter scan1 scan2 scan3 karras refit)
+set(LIBRARY_KERNELS rq_lib)  # compiled -O0: glslang/spirv-opt would drop what the rewriter copies
 set(KERNEL_GEN_DIR ${CMAKE_BINARY_DIR}/generated)
 file(MAKE_DIRECTORY ${KERNEL_GEN_DIR})
 file(GLOB KERNEL_INCLUDES CONFIGURE_DEPENDS layer/shaders/*.glsl)
@@ -35,6 +36,16 @@ foreach(k ${KERNELS})
   list(APPEND KERNEL_SPVS ${KERNEL_GEN_DIR}/${k}.spv)
   list(APPEND KERNEL_EMBED_ARGS ${k}=${KERNEL_GEN_DIR}/${k}.spv)
 endforeach()
+foreach(k ${LIBRARY_KERNELS})
+  add_custom_command(
+    OUTPUT ${KERNEL_GEN_DIR}/${k}.spv
+    COMMAND ${GLSLC} --target-env=vulkan1.2 -O0 -I${CMAKE_SOURCE_DIR}/layer/shaders
+            -o ${KERNEL_GEN_DIR}/${k}.spv ${CMAKE_SOURCE_DIR}/layer/shaders/${k}.comp
+    DEPENDS layer/shaders/${k}.comp ${KERNEL_INCLUDES}
+    COMMENT "glslc ${k}.comp (library, -O0)")
+  list(APPEND KERNEL_SPVS ${KERNEL_GEN_DIR}/${k}.spv)
+  list(APPEND KERNEL_EMBED_ARGS ${k}=${KERNEL_GEN_DIR}/${k}.spv)
+endforeach()
 add_custom_command(
   OUTPUT ${KERNEL_GEN_DIR}/kernels_spv.h
   COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/embed_spv.py
@@ -42,10 +53,11 @@ add_custom_command(
   DEPENDS ${KERNEL_SPVS} tools/embed_spv.py
   COMMENT "embedding SPIR-V kernels")
 
-add_library(VkLayer_vksoft_rt SHARED layer/src/layer.cpp layer/src/accel_build.cpp
-            ${KERNEL_GEN_DIR}/kernels_spv.h)
+find_library(SPIRV_TOOLS SPIRV-Tools REQUIRED)
+add_library(VkLayer_vksoft_rt SHARED layer/src/layer.cpp layer/src/accel_build.cpp layer/src/rq_rewrite.cpp
+            layer/src/descriptor_cells.cpp ${KERNEL_GEN_DIR}/kernels_spv.h)
 target_include_directories(VkLayer_vksoft_rt PRIVATE ${KERNEL_GEN_DIR})
-target_link_libraries(VkLayer_vksoft_rt PRIVATE Vulkan::Headers)
+target_link_libraries(VkLayer_vksoft_rt PRIVATE Vulkan::Headers ${SPIRV_TOOLS})
 target_compile_options(VkLayer_vksoft_rt PRIVATE -Wall -Wextra -Wpedantic -Wno-missing-field-initializers)
 target_link_options(VkLayer_vksoft_rt PRIVATE -Wl,--no-undefined)
 
@@ -58,6 +70,27 @@ enable_testing()
 
 add_executable(test_bvh_sizes tests/test_bvh_sizes.cpp)
 add_test(NAME bvh_sizes COMMAND test_bvh_sizes)
+
+# --- ray query rewriter test (host only) ----------------------------------------
+set(RQ_TEST_SPVS)
+foreach(spec rq_test:-O0 rq_test_opt:-O rq_two:-O0 rq_two_opt:-O rq_param:-O0 plain:-O0)
+  string(REPLACE ":" ";" parts ${spec})
+  list(GET parts 0 sname)
+  list(GET parts 1 sopt)
+  string(REGEX REPLACE "_opt$" "" ssrc ${sname})
+  add_custom_command(
+    OUTPUT ${KERNEL_GEN_DIR}/${sname}.spv
+    COMMAND ${GLSLC} --target-env=vulkan1.2 ${sopt} -o ${KERNEL_GEN_DIR}/${sname}.spv
+            ${CMAKE_SOURCE_DIR}/tests/shaders/${ssrc}.comp
+    DEPENDS tests/shaders/${ssrc}.comp
+    COMMENT "glslc ${ssrc}.comp -> ${sname}.spv")
+  list(APPEND RQ_TEST_SPVS ${KERNEL_GEN_DIR}/${sname}.spv)
+endforeach()
+add_executable(test_rq_rewrite tests/test_rq_rewrite.cpp layer/src/rq_rewrite.cpp ${KERNEL_GEN_DIR}/kernels_spv.h ${RQ_TEST_SPVS})
+target_include_directories(test_rq_rewrite PRIVATE ${KERNEL_GEN_DIR})
+target_compile_definitions(test_rq_rewrite PRIVATE TEST_SPV_DIR="${KERNEL_GEN_DIR}")
+target_link_libraries(test_rq_rewrite PRIVATE ${SPIRV_TOOLS})
+add_test(NAME rq_rewrite COMMAND test_rq_rewrite)
 
 # GPU integration test: needs a Vulkan driver with acceleration structures.
 find_library(VULKAN_LOADER vulkan)
@@ -78,10 +111,14 @@ if(VULKAN_LOADER)
   target_compile_definitions(trace_test PRIVATE TRACE_TEST_SPV="${KERNEL_GEN_DIR}/trace_test.spv")
   target_link_libraries(trace_test PRIVATE Vulkan::Headers ${VULKAN_LOADER})
   add_test(NAME trace_test COMMAND trace_test)
+  add_executable(rq_test tests/rq_test.cpp ${RQ_TEST_SPVS})
+  target_compile_definitions(rq_test PRIVATE TEST_SPV_DIR="${KERNEL_GEN_DIR}")
+  target_link_libraries(rq_test PRIVATE Vulkan::Headers ${VULKAN_LOADER})
+  add_test(NAME rq_test COMMAND rq_test)
   add_executable(tlas_build tests/tlas_build.cpp)
   target_link_libraries(tlas_build PRIVATE Vulkan::Headers ${VULKAN_LOADER})
   add_test(NAME tlas_build COMMAND tlas_build)
   add_test(NAME as_lifecycle COMMAND as_lifecycle)
-  set_tests_properties(as_lifecycle blas_build tlas_build trace_test PROPERTIES
+  set_tests_properties(as_lifecycle blas_build tlas_build trace_test rq_test PROPERTIES
     ENVIRONMENT "VK_ADD_LAYER_PATH=${CMAKE_BINARY_DIR};VK_LOADER_LAYERS_ENABLE=VK_LAYER_VKSOFT_rt;VKSOFT_RT_LOG=1")
 endif()

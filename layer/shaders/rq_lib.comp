@@ -1,0 +1,108 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "traverse.glsl"
+// ray_query runtime library. Never run as a shader: the SPIR-V rewriter copies the vk_rq_*
+// functions (and what they reference) into application modules and turns OpRayQuery*
+// instructions into calls. Each ray query variable of the application owns one slot of
+// gRQ; RQ_SLOTS is patched by the rewriter (it replaces the specialization constant).
+layout(constant_id = 0) const uint RQ_SLOTS = 1;
+
+struct RayQueryState {
+  Trav t;
+  uint64_t tlas;
+  uint rayFlags;
+  float rayTMin;
+};
+RayQueryState gRQ[RQ_SLOTS];
+
+void vk_rq_initialize(uint slot, uint64_t tlas, uint flags, uint mask, vec3 o, float tmin, vec3 d, float tmax) {
+  Trav t;
+  rayInit(t, tlas, o, d, tmin, tmax, flags, mask);
+  gRQ[slot].t = t;
+  gRQ[slot].tlas = tlas;
+  gRQ[slot].rayFlags = flags;
+  gRQ[slot].rayTMin = tmin;
+}
+
+bool vk_rq_proceed(uint slot) {
+  Trav t = gRQ[slot].t;
+  bool candidate = rayProceed(t, gRQ[slot].tlas);
+  gRQ[slot].t = t;
+  return candidate;
+}
+
+void vk_rq_terminate(uint slot) { gRQ[slot].t.done = true; }
+void vk_rq_confirmIntersection(uint slot) { Trav t = gRQ[slot].t; rayConfirmCandidate(t); gRQ[slot].t = t; }
+void vk_rq_generateIntersection(uint slot, float tHit) { /* AABB geometry not supported yet */ }
+
+HitInfo vk_rq_hit(uint slot, int committed) {
+  return committed != 0 ? gRQ[slot].t.committed : gRQ[slot].t.cand;
+}
+
+uint vk_rq_getIntersectionType(uint slot, int committed) {
+  // committed: 0 none, 1 triangle, 2 generated (AABB); candidate: 0 triangle, 1 AABB
+  return committed != 0 ? (gRQ[slot].t.committed.kind == 1u ? 1u : 0u) : 0u;
+}
+float vk_rq_getIntersectionT(uint slot, int committed) { return vk_rq_hit(slot, committed).t; }
+int vk_rq_getIntersectionInstanceCustomIndex(uint slot, int committed) { return int(vk_rq_hit(slot, committed).customIndex); }
+int vk_rq_getIntersectionInstanceId(uint slot, int committed) { return int(vk_rq_hit(slot, committed).instanceIndex); }
+uint vk_rq_getIntersectionInstanceShaderBindingTableRecordOffset(uint slot, int committed) { return vk_rq_hit(slot, committed).sbtOffset; }
+int vk_rq_getIntersectionGeometryIndex(uint slot, int committed) { return int(vk_rq_hit(slot, committed).geometryIndex); }
+int vk_rq_getIntersectionPrimitiveIndex(uint slot, int committed) { return int(vk_rq_hit(slot, committed).primitiveIndex); }
+vec2 vk_rq_getIntersectionBarycentrics(uint slot, int committed) { HitInfo h = vk_rq_hit(slot, committed); return vec2(h.u, h.v); }
+bool vk_rq_getIntersectionFrontFace(uint slot, int committed) { return vk_rq_hit(slot, committed).frontFace; }
+bool vk_rq_getIntersectionCandidateAABBOpaque(uint slot) { return false; }
+
+float vk_rq_getRayTMin(uint slot) { return gRQ[slot].rayTMin; }
+uint vk_rq_getRayFlags(uint slot) { return gRQ[slot].rayFlags; }
+vec3 vk_rq_getWorldRayOrigin(uint slot) { return gRQ[slot].t.wo; }
+vec3 vk_rq_getWorldRayDirection(uint slot) { return gRQ[slot].t.wd; }
+
+mat4x3 vk_rq_matrix(uint64_t rec, uint base) {
+  return mat4x3(vec3(ldf(rec, base + 0u), ldf(rec, base + 4u), ldf(rec, base + 8u)),
+                vec3(ldf(rec, base + 1u), ldf(rec, base + 5u), ldf(rec, base + 9u)),
+                vec3(ldf(rec, base + 2u), ldf(rec, base + 6u), ldf(rec, base + 10u)),
+                vec3(ldf(rec, base + 3u), ldf(rec, base + 7u), ldf(rec, base + 11u)));
+}
+mat4x3 vk_rq_getIntersectionObjectToWorld(uint slot, int committed) {
+  uint64_t rec = vk_rq_hit(slot, committed).instRecord;
+  return rec == 0ul ? mat4x3(1.0) : vk_rq_matrix(rec, 0u);
+}
+mat4x3 vk_rq_getIntersectionWorldToObject(uint slot, int committed) {
+  uint64_t rec = vk_rq_hit(slot, committed).instRecord;
+  return rec == 0ul ? mat4x3(1.0) : vk_rq_matrix(rec, 12u);
+}
+vec3 vk_rq_getIntersectionObjectRayOrigin(uint slot, int committed) {
+  mat4x3 m = vk_rq_getIntersectionWorldToObject(slot, committed);
+  return m * vec4(gRQ[slot].t.wo, 1.0);
+}
+vec3 vk_rq_getIntersectionObjectRayDirection(uint slot, int committed) {
+  mat4x3 m = vk_rq_getIntersectionWorldToObject(slot, committed);
+  return mat3(m) * gRQ[slot].t.wd;
+}
+
+// glslang drops uncalled functions, so main references every exported function. The
+// rewriter never copies main.
+void main() {
+  uint64_t a = pc.a[0];
+  uint s = pc.u[0];
+  int c = int(pc.u[1]);
+  vec3 v3 = vec3(ldf(a, 0u));
+  vk_rq_initialize(s, a, s, s, v3, 0.0, v3, 1.0);
+  bool b = vk_rq_proceed(s);
+  vk_rq_terminate(s);
+  vk_rq_confirmIntersection(s);
+  vk_rq_generateIntersection(s, 0.0);
+  float f = vk_rq_getIntersectionT(s, c) + vk_rq_getRayTMin(s);
+  uint u = vk_rq_getIntersectionType(s, c) + vk_rq_getIntersectionInstanceShaderBindingTableRecordOffset(s, c) +
+           vk_rq_getRayFlags(s);
+  int i = vk_rq_getIntersectionInstanceCustomIndex(s, c) + vk_rq_getIntersectionInstanceId(s, c) +
+          vk_rq_getIntersectionGeometryIndex(s, c) + vk_rq_getIntersectionPrimitiveIndex(s, c);
+  vec2 bc = vk_rq_getIntersectionBarycentrics(s, c);
+  b = b && vk_rq_getIntersectionFrontFace(s, c) && vk_rq_getIntersectionCandidateAABBOpaque(s);
+  vec3 w = vk_rq_getWorldRayOrigin(s) + vk_rq_getWorldRayDirection(s) + vk_rq_getIntersectionObjectRayOrigin(s, c) +
+           vk_rq_getIntersectionObjectRayDirection(s, c);
+  mat4x3 m = vk_rq_getIntersectionObjectToWorld(s, c) + vk_rq_getIntersectionWorldToObject(s, c);
+  st(a, 1u, floatBitsToUint(f + bc.x + w.x + m[0].x) + u + uint(i) + (b ? 1u : 0u));
+}

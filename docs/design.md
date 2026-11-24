@@ -191,7 +191,54 @@ Open correctness items: facing convention (`dot(n, d) < 0` = front, to be confir
 Vulkan CTS), AABB/procedural geometry, any-hit/intersection shader callbacks for the
 pipeline path, stack overflow currently drops entries silently (depth 64).
 
-### 4.3b `ray_query`
+### 4.3b `ray_query` (M1.5, implemented)
+**Shader side** ([layer/src/rq_rewrite.cpp](../layer/src/rq_rewrite.cpp)). Hooked into
+`vkCreateShaderModule`: modules declaring `RayQueryKHR` are rewritten, others pass through
+untouched. The rewriter works on SPIR-V *text* (SPIRV-Tools disassembler/assembler, raw
+numeric ids), so no operand grammar tables are needed:
+- The vk_rq_* library ([layer/shaders/rq_lib.comp](../layer/shaders/rq_lib.comp), compiled
+  `-O0`, otherwise glslang drops what only the rewriter references) is merged into the module:
+  only definitions reachable from the exported functions are copied, ids are renumbered, types
+  and constants are deduplicated against the application's, `GLSL.std.450` imports are shared.
+- Every `OpRayQuery*` becomes an `OpFunctionCall`. glslang passes parameters by pointer, so each
+  argument goes through a hoisted temporary variable; integer results are bit-cast to the
+  application's signedness.
+- Each `rayQueryEXT` variable owns a **slot** of a private array in the library (its size is the
+  library's spec constant, patched to the real slot count). Storage-class mismatches between
+  `Private` query variables and `Function` pointer parameters made passing pointers
+  impractical.
+- Acceleration structure variables become `StorageBuffer` blocks `{uint lo; uint hi;}`; loads
+  are rewritten into two loads + bitcast to `uint64`. The module gets `Int64`,
+  `PhysicalStorageBufferAddresses` and the `PhysicalStorageBuffer64` addressing model.
+- Unsupported patterns (a query passed to another function, arrays of queries or
+  acceleration structures) are detected and rejected: the module is passed through and a
+  message is logged. `VKSOFT_RT_VALIDATE=1` validates every rewritten module.
+
+**Descriptor side** ([layer/src/descriptor_cells.cpp](../layer/src/descriptor_cells.cpp)).
+`ACCELERATION_STRUCTURE_KHR` bindings become `STORAGE_BUFFER` in `vkCreateDescriptorSetLayout`
+and `vkCreateDescriptorPool`; `vkUpdateDescriptorSets` turns AS writes into buffer writes over a
+16-byte *address cell* (one per acceleration structure, 64k cells, released on destroy). Not
+yet covered: `vkUpdateDescriptorSetWithTemplate`, push descriptors, descriptor buffers.
+
+`tests/rq_test.cpp` runs an unmodified `GL_EXT_ray_query` GLSL shader (-O0 and -O builds)
+through all of this and checks it against the same brute-force reference in 9 flag/mask
+modes: all pass. `tests/test_rq_rewrite.cpp` validates rewritten modules with spirv-val.
+
+**Speed of the ray_query path (first, unoptimised):** 4.5 Mrays/s closest-hit and 8.2
+Mrays/s terminate-on-first-hit (same 1M-triangle worst-case scene as trace_test, where the
+direct traversal reaches 10.4 / 16.1), i.e. the rewriting costs 2x. Suspects: the traversal
+state is copied in and out of the slot array on every proceed/confirm, the library is not
+optimised, and each argument goes through a temporary. To be fixed in M3 together with the
+traversal itself.
+
+### 4.3c Open items of the ray query path
+Not implemented: procedural (AABB) candidates, `GenerateIntersection`, triangle vertex
+position fetch, descriptor templates and push descriptors, queries as function arguments.
+
+### 4.3d Ray tracing pipelines and vkd3d-proton
+Next milestones; see section 5.
+
+### 4.3e Original plan for `ray_query` (superseded by 4.3b)
 Rewrite SPIR-V: replace `OpRayQuery*` instructions with calls to a generated traversal
 function plus per-query state (SPIR-V rewriting via SPIRV-Tools passes). Traversal
 stack in workgroup memory (short stack + restart trail), subgroup operations where useful.
@@ -219,7 +266,7 @@ which images are outputs, so they are **research items**, off by default, per-ga
 | M  | Content | Validation |
 |----|---------|------------|
 | M0 | Layer skeleton, dispatch, ray_query advertisement | `vulkaninfo` shows ray_query *(done)* |
-| M1 | AS build/update/copy, own BVH; `ray_query` via SPIR-V rewrite (done: object model, sizes, triangle BLAS/TLAS builds, traversal library; next: SPIR-V rewrite + descriptors; later AABB geometry, copy/compact) | Khronos ray-query samples, Vulkan CTS RT tests, Sponza |
+| M1 | AS build/update/copy, own BVH; `ray_query` via SPIR-V rewrite (done: object model, sizes, triangle BLAS/TLAS builds, traversal library, ray_query SPIR-V rewrite + descriptors; later: AABB geometry, copy/compact, descriptor templates / push descriptors) | Khronos ray-query samples, Vulkan CTS RT tests, Sponza |
 | M2 | RT pipeline megakernel | Quake II RTX, compare against driver emulation |
 | M3 | Performance: wide/quantized BVH, refit, async build, coherence | Frame-time benchmarks vs. M2 and vs. driver |
 | M4 | DXR games via vkd3d-proton / Proton | RT-required titles |
@@ -239,8 +286,8 @@ which images are outputs, so they are **research items**, off by default, per-ga
 ## 7. Developing
 
 Tests: `ctest --test-dir build --output-on-failure` (`bvh_sizes` is pure host code;
-`as_lifecycle`, `blas_build`, `tlas_build` and `trace_test` run through the layer on the real GPU). Building needs
-`glslc` and Python 3.
+`as_lifecycle`, `blas_build`, `tlas_build`, `trace_test` and `rq_test` run through the layer on the real GPU). Building needs
+`glslc`, Python 3 and SPIRV-Tools (libSPIRV-Tools).
 
 ```
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release

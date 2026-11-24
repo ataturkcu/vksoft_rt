@@ -10,12 +10,15 @@
 
 #include "accel_build.h"
 #include "bvh_format.h"
+#include "descriptor_cells.h"
+#include "rq_rewrite.h"
 
 #include <cstdio>
 #include <cstdlib>
 #include <algorithm>
 #include <cstring>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -65,7 +68,12 @@ struct DeviceData {
   PFN_vkCmdPushConstants CmdPushConstants{};
   PFN_vkBeginCommandBuffer BeginCommandBuffer{};
   PFN_vkFreeCommandBuffers FreeCommandBuffers{};
+  PFN_vkCreateShaderModule CreateShaderModule{};
+  PFN_vkCreateDescriptorSetLayout CreateDescriptorSetLayout{};
+  PFN_vkCreateDescriptorPool CreateDescriptorPool{};
+  PFN_vkUpdateDescriptorSets UpdateDescriptorSets{};
   vksoft::BuildKernels* kernels{};  // internal build pipelines (null if unavailable)
+  vksoft::CellPool* cells{};        // TLAS address cells for rewritten descriptors
   bool asEnabled{false};            // app enabled VK_KHR_acceleration_structure
   bool rayQueryRequested{false};    // app asked for rayQuery (emulated by us)
 };
@@ -327,9 +335,15 @@ VKAPI_ATTR VkResult VKAPI_CALL hook_CreateDevice(VkPhysicalDevice pd,
   d.CmdPushConstants = reinterpret_cast<PFN_vkCmdPushConstants>(nextGdpa(*pDevice, "vkCmdPushConstants"));
   d.BeginCommandBuffer = reinterpret_cast<PFN_vkBeginCommandBuffer>(nextGdpa(*pDevice, "vkBeginCommandBuffer"));
   d.FreeCommandBuffers = reinterpret_cast<PFN_vkFreeCommandBuffers>(nextGdpa(*pDevice, "vkFreeCommandBuffers"));
+  d.CreateShaderModule = reinterpret_cast<PFN_vkCreateShaderModule>(nextGdpa(*pDevice, "vkCreateShaderModule"));
+  d.CreateDescriptorSetLayout = reinterpret_cast<PFN_vkCreateDescriptorSetLayout>(nextGdpa(*pDevice, "vkCreateDescriptorSetLayout"));
+  d.CreateDescriptorPool = reinterpret_cast<PFN_vkCreateDescriptorPool>(nextGdpa(*pDevice, "vkCreateDescriptorPool"));
+  d.UpdateDescriptorSets = reinterpret_cast<PFN_vkUpdateDescriptorSets>(nextGdpa(*pDevice, "vkUpdateDescriptorSets"));
   d.asEnabled = wantsAs;
-  if (wantsAs && d.GetBufferDeviceAddress)
+  if (wantsAs && d.GetBufferDeviceAddress) {
     d.kernels = vksoft::createBuildKernels(inst->instance, pd, *pDevice, nextGipa, nextGdpa);
+    d.cells = vksoft::createCellPool(inst->instance, pd, *pDevice, nextGipa, nextGdpa);
+  }
   d.rayQueryRequested = strip;
   {
     std::lock_guard lock(gMutex);
@@ -344,13 +358,16 @@ VKAPI_ATTR void VKAPI_CALL hook_DestroyDevice(VkDevice device,
   void* key = dispatchKey(device);
   PFN_vkDestroyDevice next;
   vksoft::BuildKernels* kernels;
+  vksoft::CellPool* cells;
   {
     std::lock_guard lock(gMutex);
     next = gDevices[key].DestroyDevice;
     kernels = gDevices[key].kernels;
+    cells = gDevices[key].cells;
     gDevices.erase(key);
   }
   vksoft::destroyBuildKernels(kernels);
+  vksoft::destroyCellPool(cells);
   next(device, pAllocator);
 }
 
@@ -389,10 +406,15 @@ VKAPI_ATTR VkResult VKAPI_CALL hook_CreateAccelerationStructureKHR(
   return VK_SUCCESS;
 }
 
-VKAPI_ATTR void VKAPI_CALL hook_DestroyAccelerationStructureKHR(VkDevice, VkAccelerationStructureKHR as,
+VKAPI_ATTR void VKAPI_CALL hook_DestroyAccelerationStructureKHR(VkDevice device, VkAccelerationStructureKHR as,
                                                                 const VkAllocationCallbacks*) {
-  std::lock_guard lock(gMutex);
-  gAccel.erase(reinterpret_cast<uint64_t>(as));
+  vksoft::CellPool* cells;
+  {
+    std::lock_guard lock(gMutex);
+    gAccel.erase(reinterpret_cast<uint64_t>(as));
+    cells = gDevices[dispatchKey(device)].cells;
+  }
+  vksoft::releaseCell(cells, reinterpret_cast<uint64_t>(as));
 }
 
 VKAPI_ATTR VkDeviceAddress VKAPI_CALL hook_GetAccelerationStructureDeviceAddressKHR(
@@ -533,6 +555,127 @@ STUB_CMD(CmdCopyMemoryToAccelerationStructureKHR)
 STUB_CMD(CmdWriteAccelerationStructuresPropertiesKHR)
 #undef STUB_CMD
 
+
+// ---- ray query support: shader modules and descriptors --------------------------------------
+
+VKAPI_ATTR VkResult VKAPI_CALL hook_CreateShaderModule(VkDevice device, const VkShaderModuleCreateInfo* ci,
+                                                       const VkAllocationCallbacks* alloc, VkShaderModule* pModule) {
+  PFN_vkCreateShaderModule next;
+  {
+    std::lock_guard lock(gMutex);
+    next = gDevices[dispatchKey(device)].CreateShaderModule;
+  }
+  std::vector<uint32_t> rewritten;
+  std::string error;
+  static const bool validate = std::getenv("VKSOFT_RT_VALIDATE") != nullptr;
+  switch (vksoft::rewriteRayQueries(ci->pCode, ci->codeSize / 4, rewritten, error, validate)) {
+    case vksoft::RewriteResult::NotNeeded:
+      break;
+    case vksoft::RewriteResult::Rewritten: {
+      LOG("shader module rewritten for ray queries (%zu -> %zu words)", size_t(ci->codeSize / 4), rewritten.size());
+      VkShaderModuleCreateInfo patched = *ci;
+      patched.codeSize = rewritten.size() * 4;
+      patched.pCode = rewritten.data();
+      return next(device, &patched, alloc, pModule);
+    }
+    case vksoft::RewriteResult::Failed:
+      std::fprintf(stderr, "[vksoft_rt] ray query rewrite failed, passing the module through: %s\n", error.c_str());
+      break;
+  }
+  return next(device, ci, alloc, pModule);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL hook_CreateDescriptorSetLayout(VkDevice device, const VkDescriptorSetLayoutCreateInfo* ci,
+                                                              const VkAllocationCallbacks* alloc,
+                                                              VkDescriptorSetLayout* pLayout) {
+  PFN_vkCreateDescriptorSetLayout next;
+  {
+    std::lock_guard lock(gMutex);
+    next = gDevices[dispatchKey(device)].CreateDescriptorSetLayout;
+  }
+  bool any = false;
+  for (uint32_t i = 0; i < ci->bindingCount; ++i)
+    if (ci->pBindings[i].descriptorType == VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR) any = true;
+  if (!any) return next(device, ci, alloc, pLayout);
+  std::vector<VkDescriptorSetLayoutBinding> b(ci->pBindings, ci->pBindings + ci->bindingCount);
+  for (auto& x : b)
+    if (x.descriptorType == VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR) x.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  VkDescriptorSetLayoutCreateInfo patched = *ci;
+  patched.pBindings = b.data();
+  return next(device, &patched, alloc, pLayout);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL hook_CreateDescriptorPool(VkDevice device, const VkDescriptorPoolCreateInfo* ci,
+                                                         const VkAllocationCallbacks* alloc, VkDescriptorPool* pPool) {
+  PFN_vkCreateDescriptorPool next;
+  {
+    std::lock_guard lock(gMutex);
+    next = gDevices[dispatchKey(device)].CreateDescriptorPool;
+  }
+  bool any = false;
+  for (uint32_t i = 0; i < ci->poolSizeCount; ++i)
+    if (ci->pPoolSizes[i].type == VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR) any = true;
+  if (!any) return next(device, ci, alloc, pPool);
+  std::vector<VkDescriptorPoolSize> sizes;
+  uint32_t extra = 0;
+  for (uint32_t i = 0; i < ci->poolSizeCount; ++i) {
+    if (ci->pPoolSizes[i].type == VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR) extra += ci->pPoolSizes[i].descriptorCount;
+    else sizes.push_back(ci->pPoolSizes[i]);
+  }
+  bool merged = false;
+  for (auto& sz : sizes)
+    if (sz.type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) { sz.descriptorCount += extra; merged = true; }
+  if (!merged) sizes.push_back({VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, extra});
+  VkDescriptorPoolCreateInfo patched = *ci;
+  patched.poolSizeCount = uint32_t(sizes.size());
+  patched.pPoolSizes = sizes.data();
+  return next(device, &patched, alloc, pPool);
+}
+
+VKAPI_ATTR void VKAPI_CALL hook_UpdateDescriptorSets(VkDevice device, uint32_t writeCount, const VkWriteDescriptorSet* pWrites,
+                                                     uint32_t copyCount, const VkCopyDescriptorSet* pCopies) {
+  PFN_vkUpdateDescriptorSets next;
+  vksoft::CellPool* cells;
+  {
+    std::lock_guard lock(gMutex);
+    DeviceData& dd = gDevices[dispatchKey(device)];
+    next = dd.UpdateDescriptorSets;
+    cells = dd.cells;
+  }
+  bool any = false;
+  for (uint32_t i = 0; i < writeCount; ++i)
+    if (pWrites[i].descriptorType == VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR) any = true;
+  if (!any || !cells) return next(device, writeCount, pWrites, copyCount, pCopies);
+
+  std::vector<VkWriteDescriptorSet> writes(pWrites, pWrites + writeCount);
+  std::vector<std::vector<VkDescriptorBufferInfo>> infos(writeCount);
+  for (uint32_t i = 0; i < writeCount; ++i) {
+    if (writes[i].descriptorType != VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR) continue;
+    const VkWriteDescriptorSetAccelerationStructureKHR* as = nullptr;
+    for (auto* n = reinterpret_cast<const VkBaseInStructure*>(writes[i].pNext); n; n = n->pNext)
+      if (n->sType == VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR)
+        as = reinterpret_cast<const VkWriteDescriptorSetAccelerationStructureKHR*>(n);
+    infos[i].resize(writes[i].descriptorCount);
+    for (uint32_t j = 0; j < writes[i].descriptorCount; ++j) {
+      uint64_t key = as ? reinterpret_cast<uint64_t>(as->pAccelerationStructures[j]) : 0;
+      uint64_t addr = 0;
+      if (key) {
+        std::lock_guard lock(gMutex);
+        auto it = gAccel.find(key);
+        if (it != gAccel.end()) addr = it->second.address;
+      }
+      if (!vksoft::cellInfo(cells, key, addr, &infos[i][j])) {
+        std::fprintf(stderr, "[vksoft_rt] acceleration structure cell pool exhausted\n");
+        vksoft::cellInfo(cells, 0, 0, &infos[i][j]);
+      }
+    }
+    writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[i].pNext = nullptr;
+    writes[i].pBufferInfo = infos[i].data();
+  }
+  next(device, writeCount, writes.data(), copyCount, pCopies);
+}
+
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL hook_GetDeviceProcAddr(VkDevice device, const char* name);
 
 struct Hook {
@@ -550,6 +693,10 @@ const Hook kInstanceHooks[] = {
 };
 // Hot-path commands we only intercept on devices where the app uses acceleration structures.
 const Hook kTrackingHooks[] = {
+    H(CreateShaderModule),
+    H(CreateDescriptorSetLayout),
+    H(CreateDescriptorPool),
+    H(UpdateDescriptorSets),
     H(CmdBindPipeline),
     H(CmdPushConstants),
     H(BeginCommandBuffer),
