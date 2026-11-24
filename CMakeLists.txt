@@ -67,10 +67,21 @@ if(VULKAN_LOADER)
   add_executable(blas_build tests/blas_build.cpp)
   target_link_libraries(blas_build PRIVATE Vulkan::Headers ${VULKAN_LOADER})
   add_test(NAME blas_build COMMAND blas_build)
+  # traversal test shader (uses the layer's traversal code through the same include dir)
+  add_custom_command(
+    OUTPUT ${KERNEL_GEN_DIR}/trace_test.spv
+    COMMAND ${GLSLC} --target-env=vulkan1.2 -O -I${CMAKE_SOURCE_DIR}/layer/shaders
+            -o ${KERNEL_GEN_DIR}/trace_test.spv ${CMAKE_SOURCE_DIR}/tests/shaders/trace_test.comp
+    DEPENDS tests/shaders/trace_test.comp ${KERNEL_INCLUDES}
+    COMMENT "glslc trace_test.comp")
+  add_executable(trace_test tests/trace_test.cpp ${KERNEL_GEN_DIR}/trace_test.spv)
+  target_compile_definitions(trace_test PRIVATE TRACE_TEST_SPV="${KERNEL_GEN_DIR}/trace_test.spv")
+  target_link_libraries(trace_test PRIVATE Vulkan::Headers ${VULKAN_LOADER})
+  add_test(NAME trace_test COMMAND trace_test)
   add_executable(tlas_build tests/tlas_build.cpp)
   target_link_libraries(tlas_build PRIVATE Vulkan::Headers ${VULKAN_LOADER})
   add_test(NAME tlas_build COMMAND tlas_build)
   add_test(NAME as_lifecycle COMMAND as_lifecycle)
-  set_tests_properties(as_lifecycle blas_build tlas_build PROPERTIES
+  set_tests_properties(as_lifecycle blas_build tlas_build trace_test PROPERTIES
     ENVIRONMENT "VK_ADD_LAYER_PATH=${CMAKE_BINARY_DIR};VK_LOADER_LAYERS_ENABLE=VK_LAYER_VKSOFT_rt;VKSOFT_RT_LOG=1")
 endif()

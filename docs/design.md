@@ -165,7 +165,33 @@ Measured (includes readback copy): 5k instances 0.8 ms, 200k instances 37 ms.
 `tests/tlas_build.cpp` verifies shape, tight world boxes, every instance exactly once, record
 fields, the inverse transform, inactive handling, pointer-array mode and Morton ties.
 
-### 4.3 `ray_query`
+### 4.3 Traversal (M1.4, implemented as a standalone GLSL library)
+[layer/shaders/traverse.glsl](../layer/shaders/traverse.glsl) is a **resumable state machine**
+(`rayInit` / `rayProceed` / `rayConfirmCandidate`), so one implementation serves both
+`ray_query` (non-opaque candidates are handed to the caller) and the future pipeline
+megakernel. It covers: two-level traversal with nearest-child-first order, instance masks,
+all ray flags (opaque/no-opaque, terminate-on-first-hit, cull front/back/opaque/no-opaque,
+skip triangles), instance flags (facing-cull-disable, flip facing, force (no-)opaque),
+object-space facing, watertight triangle intersection (Woop 2013) and empty-box rejection.
+
+`tests/trace_test.cpp` runs it from a compute shader and compares every ray with a
+brute-force double-precision CPU reference in 9 flag/mask modes (hit identity, distance,
+barycentrics, facing, custom index; ambiguity band for edge hits because float32 traversal
+at coordinates ~1e2 carries ~1e-3 absolute error). Current result: all modes pass, 0.3% of
+rays are edge-ambiguous.
+
+**Baseline speed (naive, to be optimised in M3):** 10 Mrays/s closest-hit and 16 Mrays/s
+terminate-on-first-hit on the GTX 1660 Ti for 1M fully random (incoherent) rays against a
+1M-triangle random triangle soup (worst case for BVH quality, 38% hit). Known reasons:
+binary uncompressed BVH, per-thread stack in local memory, `coherent` loads everywhere,
+no ray sorting/coherence, no wide nodes. Real-game numbers need a real scene and an
+apples-to-apples measurement of the driver's own emulation (pipeline path) — planned.
+
+Open correctness items: facing convention (`dot(n, d) < 0` = front, to be confirmed against
+Vulkan CTS), AABB/procedural geometry, any-hit/intersection shader callbacks for the
+pipeline path, stack overflow currently drops entries silently (depth 64).
+
+### 4.3b `ray_query`
 Rewrite SPIR-V: replace `OpRayQuery*` instructions with calls to a generated traversal
 function plus per-query state (SPIR-V rewriting via SPIRV-Tools passes). Traversal
 stack in workgroup memory (short stack + restart trail), subgroup operations where useful.
@@ -193,7 +219,7 @@ which images are outputs, so they are **research items**, off by default, per-ga
 | M  | Content | Validation |
 |----|---------|------------|
 | M0 | Layer skeleton, dispatch, ray_query advertisement | `vulkaninfo` shows ray_query *(done)* |
-| M1 | AS build/update/copy, own BVH; `ray_query` via SPIR-V rewrite (done: object model, sizes, triangle BLAS and TLAS GPU builds; next: traversal + SPIR-V rewrite + descriptors; later AABB geometry, copy/compact) | Khronos ray-query samples, Vulkan CTS RT tests, Sponza |
+| M1 | AS build/update/copy, own BVH; `ray_query` via SPIR-V rewrite (done: object model, sizes, triangle BLAS/TLAS builds, traversal library; next: SPIR-V rewrite + descriptors; later AABB geometry, copy/compact) | Khronos ray-query samples, Vulkan CTS RT tests, Sponza |
 | M2 | RT pipeline megakernel | Quake II RTX, compare against driver emulation |
 | M3 | Performance: wide/quantized BVH, refit, async build, coherence | Frame-time benchmarks vs. M2 and vs. driver |
 | M4 | DXR games via vkd3d-proton / Proton | RT-required titles |
@@ -213,7 +239,7 @@ which images are outputs, so they are **research items**, off by default, per-ga
 ## 7. Developing
 
 Tests: `ctest --test-dir build --output-on-failure` (`bvh_sizes` is pure host code;
-`as_lifecycle`, `blas_build` and `tlas_build` run through the layer on the real GPU). Building needs
+`as_lifecycle`, `blas_build`, `tlas_build` and `trace_test` run through the layer on the real GPU). Building needs
 `glslc` and Python 3.
 
 ```

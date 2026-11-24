@@ -1,0 +1,27 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "traverse.glsl"
+layout(local_size_x = 64) in;
+// a0 TLAS, a1 rays (8 floats: o.xyz tmin d.xyz tmax), a2 results (8 words per ray)
+// u0 count, u1 ray flags, u2 cull mask
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  if (i >= pc.u[0]) return;
+  uint64_t r = pc.a[1] + uint64_t(i) * 32ul;
+  vec3 o = vec3(ldf(r, 0), ldf(r, 1), ldf(r, 2));
+  vec3 d = vec3(ldf(r, 4), ldf(r, 5), ldf(r, 6));
+  Trav s;
+  rayInit(s, pc.a[0], o, d, ldf(r, 3), ldf(r, 7), pc.u[1], pc.u[2]);
+  while (rayProceed(s, pc.a[0])) rayConfirmCandidate(s);
+  uint64_t out0 = pc.a[2] + uint64_t(i) * 32ul;
+  HitInfo h = s.committed;
+  st(out0, 0, floatBitsToUint(h.t));
+  st(out0, 1, h.kind | (h.frontFace ? 2u : 0u));
+  st(out0, 2, h.instanceIndex);
+  st(out0, 3, h.geometryIndex);
+  st(out0, 4, h.primitiveIndex);
+  st(out0, 5, floatBitsToUint(h.u));
+  st(out0, 6, floatBitsToUint(h.v));
+  st(out0, 7, h.customIndex);
+}
