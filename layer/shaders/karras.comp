@@ -1,0 +1,41 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+layout(local_size_x = 256) in;
+// Karras 2012 binary radix tree over the sorted Morton keys.
+// a0 nodes (dst AS), a1 sorted keys, a2 parent[2N-1]; u0 = N. One thread per internal node.
+int delta(int i, int j) {
+  int n = int(pc.u[0]);
+  if (j < 0 || j >= n) return -1;
+  uint ki = ld(pc.a[1], uint(i)), kj = ld(pc.a[1], uint(j));
+  if (ki == kj) return 32 + (31 - findMSB(uint(i) ^ uint(j)));
+  return 31 - findMSB(ki ^ kj);
+}
+void main() {
+  int i = int(gl_GlobalInvocationID.x);
+  int n = int(pc.u[0]);
+  if (i >= n - 1) return;
+  int d = (delta(i, i + 1) - delta(i, i - 1)) >= 0 ? 1 : -1;
+  int dmin = delta(i, i - d);
+  int lmax = 2;
+  while (delta(i, i + lmax * d) > dmin) lmax *= 2;
+  int l = 0;
+  for (int t = lmax / 2; t >= 1; t /= 2)
+    if (delta(i, i + (l + t) * d) > dmin) l += t;
+  int j = i + l * d;
+  int dnode = delta(i, j);
+  int s = 0, t = l;
+  do {
+    t = (t + 1) >> 1;
+    if (delta(i, i + (s + t) * d) > dnode) s += t;
+  } while (t > 1);
+  int gamma = i + s * d + min(d, 0);
+  uint left = (min(i, j) == gamma) ? (LEAF_BIT | uint(gamma)) : uint(gamma);
+  uint right = (max(i, j) == gamma + 1) ? (LEAF_BIT | uint(gamma + 1)) : uint(gamma + 1);
+  st(pc.a[0], uint(i) * NODE_WORDS + 12u, left);
+  st(pc.a[0], uint(i) * NODE_WORDS + 13u, right);
+  uint pl = (left & LEAF_BIT) != 0u ? uint(n - 1) + (left & ~LEAF_BIT) : left;
+  uint pr = (right & LEAF_BIT) != 0u ? uint(n - 1) + (right & ~LEAF_BIT) : right;
+  st(pc.a[2], pl, uint(i));
+  st(pc.a[2], pr, uint(i));
+}

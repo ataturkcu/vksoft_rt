@@ -1,0 +1,49 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+layout(local_size_x = 256) in;
+// Writes leaves in sorted order and computes node boxes bottom-up (second child to
+// arrive does the merge). a0 nodes, a1 dst prims, a2 src triangles, a3 sorted values,
+// a4 parent[], a5 flags[], a6 dst header; u0 = N
+void main() {
+  uint k = gl_GlobalInvocationID.x;
+  uint n = pc.u[0];
+  if (k >= n) return;
+  uint src = ld(pc.a[3], k);
+  uint64_t tri = pc.a[2] + uint64_t(src) * uint64_t(TRI_BYTES);
+  uint64_t dst = pc.a[1] + uint64_t(k) * uint64_t(TRI_BYTES);
+  float b[6];
+  for (uint w = 0; w < TRI_WORDS; ++w) st(dst, w, ld(tri, w));
+  for (uint a = 0; a < 3; ++a) {
+    float x = ldf(tri, a), y = ldf(tri, 3 + a), z = ldf(tri, 6 + a);
+    b[a] = min(x, min(y, z));
+    b[3 + a] = max(x, max(y, z));
+  }
+  uint cur = LEAF_BIT | k;
+  uint pidx = (n - 1u) + k;
+  for (;;) {
+    uint p = ld(pc.a[4], pidx);
+    if (p == NONE) {
+      for (uint w = 0; w < 6; ++w) stf(pc.a[6], 8u + w, b[w]);
+      return;
+    }
+    uint64_t node = pc.a[0] + uint64_t(p) * uint64_t(NODE_WORDS) * 4ul;
+    uint slot = (ld(node, 12u) == cur) ? 0u : 1u;
+    // Box words are exchanged/loaded with atomics so they are performed at L2 and never
+    // served from a stale L1 line (plain/coherent accesses showed stale sibling data).
+    for (uint w = 0; w < 6; ++w) atomicExchange(Words(node).v[slot * 6u + w], floatBitsToUint(b[w]));
+    memoryBarrier();
+    uint old = atomicAdd(Words(pc.a[5]).v[p], 1u);
+    if (old == 0u) return;  // sibling not done yet; it will merge
+    memoryBarrier();
+    uint other = 1u - slot;
+    for (uint a = 0; a < 3; ++a) {
+      float omn = uintBitsToFloat(atomicOr(Words(node).v[other * 6u + a], 0u));
+      float omx = uintBitsToFloat(atomicOr(Words(node).v[other * 6u + 3u + a], 0u));
+      b[a] = min(b[a], omn);
+      b[3 + a] = max(b[3 + a], omx);
+    }
+    cur = p;
+    pidx = p;
+  }
+}

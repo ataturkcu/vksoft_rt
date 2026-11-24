@@ -8,6 +8,7 @@
 #include <vulkan/vulkan.h>
 #include <vulkan/vk_layer.h>
 
+#include "accel_build.h"
 #include "bvh_format.h"
 
 #include <cstdio>
@@ -60,7 +61,22 @@ struct DeviceData {
   PFN_vkGetDeviceProcAddr gdpa{};
   PFN_vkDestroyDevice DestroyDevice{};
   PFN_vkGetBufferDeviceAddress GetBufferDeviceAddress{};
-  bool rayQueryRequested{false};  // app asked for rayQuery (emulated by us)
+  PFN_vkCmdBindPipeline CmdBindPipeline{};
+  PFN_vkCmdPushConstants CmdPushConstants{};
+  PFN_vkBeginCommandBuffer BeginCommandBuffer{};
+  PFN_vkFreeCommandBuffers FreeCommandBuffers{};
+  vksoft::BuildKernels* kernels{};  // internal build pipelines (null if unavailable)
+  bool asEnabled{false};            // app enabled VK_KHR_acceleration_structure
+  bool rayQueryRequested{false};    // app asked for rayQuery (emulated by us)
+};
+
+// Compute state of a command buffer that our build kernels clobber and must restore.
+struct CmdState {
+  VkPipeline computePipeline{};
+  VkPipelineLayout pushLayout{};
+  VkShaderStageFlags pushStages{};
+  uint32_t pushMin{UINT32_MAX}, pushMax{0};
+  uint8_t push[256]{};
 };
 
 // An acceleration structure is a layer-owned object: the handle is fake (the driver
@@ -76,6 +92,7 @@ struct AsData {
 std::mutex gMutex;
 std::unordered_map<void*, InstanceData> gInstances;
 std::unordered_map<void*, DeviceData> gDevices;
+std::unordered_map<VkCommandBuffer, CmdState> gCmd;
 std::unordered_map<uint64_t, AsData> gAccel;  // fake handle -> data
 uint64_t gNextAsHandle = 1;
 constexpr uint64_t kAsHandleTag = 0x5a53'0000'0000'0000ull;  // makes stray handles obvious
@@ -244,7 +261,29 @@ VKAPI_ATTR VkResult VKAPI_CALL hook_CreateDevice(VkPhysicalDevice pd,
     if (std::strcmp(ci.ppEnabledExtensionNames[i], kRayQueryExt) == 0) wantsRayQuery = true;
     else exts.push_back(ci.ppEnabledExtensionNames[i]);
   }
+  bool wantsAs = false;
+  for (uint32_t i = 0; i < ci.enabledExtensionCount; ++i)
+    if (std::strcmp(ci.ppEnabledExtensionNames[i], VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) == 0)
+      wantsAs = true;
   bool strip = wantsRayQuery && canAdvertiseRayQuery(*inst, pd);
+
+  // Our build kernels use 64-bit integers (buffer device addresses): force shaderInt64.
+  VkPhysicalDeviceFeatures forcedFeatures{};
+  VkPhysicalDeviceFeatures2* features2 = nullptr;
+  VkBool32 savedInt64 = VK_FALSE;
+  if (wantsAs) {
+    for (auto* n = reinterpret_cast<const VkBaseInStructure*>(ci.pNext); n; n = n->pNext)
+      if (n->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2)
+        features2 = reinterpret_cast<VkPhysicalDeviceFeatures2*>(const_cast<VkBaseInStructure*>(n));
+    if (features2) {
+      savedInt64 = features2->features.shaderInt64;
+      features2->features.shaderInt64 = VK_TRUE;
+    } else {
+      if (ci.pEnabledFeatures) forcedFeatures = *ci.pEnabledFeatures;
+      forcedFeatures.shaderInt64 = VK_TRUE;
+      ci.pEnabledFeatures = &forcedFeatures;
+    }
+  }
   if (strip) {
     ci.enabledExtensionCount = static_cast<uint32_t>(exts.size());
     ci.ppEnabledExtensionNames = exts.data();
@@ -272,6 +311,7 @@ VKAPI_ATTR VkResult VKAPI_CALL hook_CreateDevice(VkPhysicalDevice pd,
     unlinked->pNext = unlinkedPrev->pNext;
     unlinkedPrev->pNext = unlinked;
   }
+  if (features2) features2->features.shaderInt64 = savedInt64;
   if (res != VK_SUCCESS) return res;
 
   DeviceData d;
@@ -283,6 +323,13 @@ VKAPI_ATTR VkResult VKAPI_CALL hook_CreateDevice(VkPhysicalDevice pd,
   if (!d.GetBufferDeviceAddress)
     d.GetBufferDeviceAddress = reinterpret_cast<PFN_vkGetBufferDeviceAddress>(
         nextGdpa(*pDevice, "vkGetBufferDeviceAddressKHR"));
+  d.CmdBindPipeline = reinterpret_cast<PFN_vkCmdBindPipeline>(nextGdpa(*pDevice, "vkCmdBindPipeline"));
+  d.CmdPushConstants = reinterpret_cast<PFN_vkCmdPushConstants>(nextGdpa(*pDevice, "vkCmdPushConstants"));
+  d.BeginCommandBuffer = reinterpret_cast<PFN_vkBeginCommandBuffer>(nextGdpa(*pDevice, "vkBeginCommandBuffer"));
+  d.FreeCommandBuffers = reinterpret_cast<PFN_vkFreeCommandBuffers>(nextGdpa(*pDevice, "vkFreeCommandBuffers"));
+  d.asEnabled = wantsAs;
+  if (wantsAs && d.GetBufferDeviceAddress)
+    d.kernels = vksoft::createBuildKernels(inst->instance, pd, *pDevice, nextGipa, nextGdpa);
   d.rayQueryRequested = strip;
   {
     std::lock_guard lock(gMutex);
@@ -296,11 +343,14 @@ VKAPI_ATTR void VKAPI_CALL hook_DestroyDevice(VkDevice device,
                                               const VkAllocationCallbacks* pAllocator) {
   void* key = dispatchKey(device);
   PFN_vkDestroyDevice next;
+  vksoft::BuildKernels* kernels;
   {
     std::lock_guard lock(gMutex);
     next = gDevices[key].DestroyDevice;
+    kernels = gDevices[key].kernels;
     gDevices.erase(key);
   }
+  vksoft::destroyBuildKernels(kernels);
   next(device, pAllocator);
 }
 
@@ -371,13 +421,111 @@ VKAPI_ATTR void VKAPI_CALL hook_GetAccelerationStructureBuildSizesKHR(
   out->updateScratchSize = updateScratchSize(n);
 }
 
+// ---- command buffer state tracking (needed to restore state after our kernels) --------
+
+VKAPI_ATTR void VKAPI_CALL hook_CmdBindPipeline(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipeline p) {
+  PFN_vkCmdBindPipeline next;
+  {
+    std::lock_guard lock(gMutex);
+    next = gDevices[dispatchKey(cb)].CmdBindPipeline;
+    if (bp == VK_PIPELINE_BIND_POINT_COMPUTE) gCmd[cb].computePipeline = p;
+  }
+  next(cb, bp, p);
+}
+
+VKAPI_ATTR void VKAPI_CALL hook_CmdPushConstants(VkCommandBuffer cb, VkPipelineLayout layout,
+                                                 VkShaderStageFlags stages, uint32_t offset, uint32_t size,
+                                                 const void* values) {
+  PFN_vkCmdPushConstants next;
+  {
+    std::lock_guard lock(gMutex);
+    next = gDevices[dispatchKey(cb)].CmdPushConstants;
+    if ((stages & VK_SHADER_STAGE_COMPUTE_BIT) && offset + size <= sizeof(CmdState::push)) {
+      CmdState& st = gCmd[cb];
+      std::memcpy(st.push + offset, values, size);
+      st.pushLayout = layout;
+      st.pushStages = stages;
+      st.pushMin = std::min(st.pushMin, offset);
+      st.pushMax = std::max(st.pushMax, offset + size);
+    }
+  }
+  next(cb, layout, stages, offset, size, values);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL hook_BeginCommandBuffer(VkCommandBuffer cb, const VkCommandBufferBeginInfo* bi) {
+  PFN_vkBeginCommandBuffer next;
+  {
+    std::lock_guard lock(gMutex);
+    next = gDevices[dispatchKey(cb)].BeginCommandBuffer;
+    gCmd.erase(cb);
+  }
+  return next(cb, bi);
+}
+
+VKAPI_ATTR void VKAPI_CALL hook_FreeCommandBuffers(VkDevice device, VkCommandPool pool, uint32_t count,
+                                                   const VkCommandBuffer* cbs) {
+  PFN_vkFreeCommandBuffers next;
+  {
+    std::lock_guard lock(gMutex);
+    next = gDevices[dispatchKey(device)].FreeCommandBuffers;
+    for (uint32_t i = 0; i < count; ++i) gCmd.erase(cbs[i]);
+  }
+  next(device, pool, count, cbs);
+}
+
+VKAPI_ATTR void VKAPI_CALL hook_CmdBuildAccelerationStructuresKHR(
+    VkCommandBuffer cb, uint32_t infoCount, const VkAccelerationStructureBuildGeometryInfoKHR* pInfos,
+    const VkAccelerationStructureBuildRangeInfoKHR* const* ppRanges) {
+  vksoft::BuildKernels* kernels;
+  PFN_vkCmdBindPipeline bindPipeline;
+  PFN_vkCmdPushConstants pushConstants;
+  {
+    std::lock_guard lock(gMutex);
+    DeviceData& dd = gDevices[dispatchKey(cb)];
+    kernels = dd.kernels;
+    bindPipeline = dd.CmdBindPipeline;
+    pushConstants = dd.CmdPushConstants;
+  }
+  if (!kernels) {
+    LOG("CmdBuildAccelerationStructuresKHR: build kernels unavailable on this device (ignored)");
+    return;
+  }
+
+  for (uint32_t i = 0; i < infoCount; ++i) {
+    VkDeviceAddress dst = 0;
+    {
+      std::lock_guard lock(gMutex);
+      auto it = gAccel.find(reinterpret_cast<uint64_t>(pInfos[i].dstAccelerationStructure));
+      if (it != gAccel.end()) dst = it->second.address;
+    }
+    if (!dst) {
+      LOG("build %u: unknown destination acceleration structure (ignored)", i);
+      continue;
+    }
+    if (!vksoft::recordBuild(kernels, cb, pInfos[i], ppRanges[i], dst))
+      LOG("build %u: request not supported yet (ignored)", i);
+  }
+
+  // Our kernels rebound the compute pipeline and overwrote compute push constants;
+  // the app expects its own state to be intact after the build command.
+  CmdState saved;
+  {
+    std::lock_guard lock(gMutex);
+    auto it = gCmd.find(cb);
+    if (it != gCmd.end()) saved = it->second;
+  }
+  if (saved.computePipeline) bindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, saved.computePipeline);
+  if (saved.pushLayout && saved.pushMax > saved.pushMin)
+    pushConstants(cb, saved.pushLayout, saved.pushStages, saved.pushMin, saved.pushMax - saved.pushMin,
+                  saved.push + saved.pushMin);
+}
+
 // Our handles must never reach the driver. Until the GPU build lands, commands that
 // consume them are no-ops (loudly logged) rather than crashes inside the driver.
 #define STUB_CMD(name)                                                        \
   VKAPI_ATTR void VKAPI_CALL hook_##name(VkCommandBuffer, ...) {              \
     LOG(#name ": not implemented yet (ignored)");                             \
   }
-STUB_CMD(CmdBuildAccelerationStructuresKHR)
 STUB_CMD(CmdBuildAccelerationStructuresIndirectKHR)
 STUB_CMD(CmdCopyAccelerationStructureKHR)
 STUB_CMD(CmdCopyAccelerationStructureToMemoryKHR)
@@ -400,6 +548,13 @@ const Hook kInstanceHooks[] = {
     H(CreateDevice),
     H(GetDeviceProcAddr),
 };
+// Hot-path commands we only intercept on devices where the app uses acceleration structures.
+const Hook kTrackingHooks[] = {
+    H(CmdBindPipeline),
+    H(CmdPushConstants),
+    H(BeginCommandBuffer),
+    H(FreeCommandBuffers),
+};
 const Hook kDeviceHooks[] = {
     H(DestroyDevice),
     H(GetDeviceProcAddr),
@@ -420,12 +575,17 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL hook_GetDeviceProcAddr(VkDevice device,
   for (auto& h : kDeviceHooks)
     if (std::strcmp(h.name, name) == 0) return h.fn;
   PFN_vkGetDeviceProcAddr next;
+  bool track;
   {
     std::lock_guard lock(gMutex);
     auto it = gDevices.find(dispatchKey(device));
     if (it == gDevices.end()) return nullptr;
     next = it->second.gdpa;
+    track = it->second.asEnabled;
   }
+  if (track)
+    for (auto& h : kTrackingHooks)
+      if (std::strcmp(h.name, name) == 0) return h.fn;
   return next(device, name);
 }
 

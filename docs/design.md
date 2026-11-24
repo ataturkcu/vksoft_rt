@@ -106,6 +106,44 @@ calling the real `vkCreateDevice`. Advertising only happens if the driver expose
   device (harmless; keeps the feature chain valid). Dropping that dependency is needed for
   other vendors later.
 
+#### BLAS build pipeline (M1.2, implemented for triangle geometry)
+Compute kernels in [layer/shaders/](../layer/shaders), recorded into the app's command
+buffer by [layer/src/accel_build.cpp](../layer/src/accel_build.cpp). All memory is accessed
+through buffer device addresses; parameters travel in a 128-byte push-constant block.
+
+`init` -> `header` -> `fetch_tris` (per geometry: index/vertex fetch, geometry transform,
+centroid bounds) -> `morton` (30-bit) -> 4 x [`radix_hist`, `scan1/2/3`, `radix_scatter`]
+(stable 8-bit LSD radix sort, subgroup-ballot ranking) -> `karras` (binary radix tree) ->
+`refit` (writes leaves in sorted order, bottom-up boxes).
+
+Current format is a **binary BVH** (64 B nodes: two child boxes + two child refs, leaf =
+`0x80000000 | primIndex`, one triangle per leaf, 128 B header with root/bounds). This stays
+within the size bounds reserved for the planned wide/quantized format, so the collapse to
+BVH4/8 (M3) is a drop-in replacement. Triangles are stored pre-transformed (48 B records).
+
+Measured on the 1660 Ti (includes copying the 112 MB result back, so it is an upper
+bound): 100k triangles 3.2 ms, 1M triangles 25 ms. Correctness is checked on the CPU by
+`tests/blas_build.cpp` (tree shape, tight boxes, every leaf exactly once, exact triangle
+set incl. ids/transforms, ties, block-edge sizes).
+
+Known limitations / decisions:
+- Only `R32G32B32_SFLOAT` triangles; AABB geometry, TLAS, host builds, copy/compact/
+  serialize are not implemented yet (M1.3+). `mode = UPDATE` is treated as a full rebuild
+  (always correct; refit-only update is an M3 optimisation).
+- Kernels assume subgroup size 32 (+ballot/arithmetic); the layer disables the builder
+  otherwise (AMD/Intel need a generic path later).
+- The layer forces `shaderInt64` on devices that enable acceleration structures.
+- The app's barriers name the driver's AS-build stage, which may not cover our compute
+  work, so every build is fenced with ALL_COMMANDS barriers before and after. Correct but
+  conservative; to be relaxed by tracking the app's barriers.
+- A build clobbers the bound compute pipeline and compute push constants, so the layer
+  tracks `vkCmdBindPipeline`/`vkCmdPushConstants` (only on devices using AS) and restores
+  them after each build. `vkCmdPushConstants2` is not tracked yet.
+- NaN triangles are not yet excluded (spec: such primitives are inactive).
+- Refit finding: the second-arriving thread must read its sibling's box with atomics;
+  plain/`coherent` loads returned stale data intermittently on NVIDIA. Atomics for all
+  six words is correct but not free; revisit when optimising.
+
 ### 4.3 `ray_query`
 Rewrite SPIR-V: replace `OpRayQuery*` instructions with calls to a generated traversal
 function plus per-query state (SPIR-V rewriting via SPIRV-Tools passes). Traversal
@@ -134,7 +172,7 @@ which images are outputs, so they are **research items**, off by default, per-ga
 | M  | Content | Validation |
 |----|---------|------------|
 | M0 | Layer skeleton, dispatch, ray_query advertisement | `vulkaninfo` shows ray_query *(done)* |
-| M1 | AS build/update/copy, own BVH; `ray_query` via SPIR-V rewrite (M1.1 object model + sizes: done; next: GPU build) | Khronos ray-query samples, Vulkan CTS RT tests, Sponza |
+| M1 | AS build/update/copy, own BVH; `ray_query` via SPIR-V rewrite (done: object model, sizes, triangle BLAS GPU build; next: TLAS/AABB, then traversal + SPIR-V rewrite) | Khronos ray-query samples, Vulkan CTS RT tests, Sponza |
 | M2 | RT pipeline megakernel | Quake II RTX, compare against driver emulation |
 | M3 | Performance: wide/quantized BVH, refit, async build, coherence | Frame-time benchmarks vs. M2 and vs. driver |
 | M4 | DXR games via vkd3d-proton / Proton | RT-required titles |
@@ -154,7 +192,8 @@ which images are outputs, so they are **research items**, off by default, per-ga
 ## 7. Developing
 
 Tests: `ctest --test-dir build --output-on-failure` (`bvh_sizes` is pure host code;
-`as_lifecycle` runs through the layer on the real GPU).
+`as_lifecycle` and `blas_build` run through the layer on the real GPU). Building needs
+`glslc` and Python 3.
 
 ```
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release

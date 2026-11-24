@@ -1,0 +1,9 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+layout(local_size_x = 1) in;
+// In-place exclusive scan of the chunk sums, serial (count is small). a0 sums; u0 = C
+void main() {
+  uint run = 0u;
+  for (uint i = 0; i < pc.u[0]; ++i) { uint x = ld(pc.a[0], i); st(pc.a[0], i, run); run += x; }
+}

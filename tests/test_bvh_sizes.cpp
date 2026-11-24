@@ -23,6 +23,12 @@ int main() {
     CHECK(updateScratchSize(n) <= buildScratchSize(n));
     CHECK(buildScratchSize(n) >= kScratchFixed + n * 32 * 2);  // binary tree must fit
   }
+  for (uint64_t n : {0ull, 1ull, 2ull, 255ull, 256ull, 257ull, 1000ull, 100000ull, 5000000ull}) {
+    ScratchLayout l = scratchLayout(n);
+    CHECK(l.total <= buildScratchSize(n));
+    CHECK(l.tris % 16 == 0 && l.hist % 16 == 0);
+    CHECK(l.blocks * kRadixBlock >= (n ? n : 1));
+  }
   // monotonic in n
   CHECK(accelerationStructureSize(10, kTrianglePrimBytes) <=
         accelerationStructureSize(11, kTrianglePrimBytes));

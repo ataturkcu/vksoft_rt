@@ -1,0 +1,19 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "radix_common.glsl"
+layout(local_size_x = 256) in;
+// a0 keys in, a1 vals in, a2 keys out, a3 vals out, a4 scanned histogram
+// u0 N, u1 shift, u2 numBlocks
+void main() {
+  uint gid = gl_GlobalInvocationID.x;
+  bool valid = gid < pc.u[0];
+  uint key = valid ? ld(pc.a[0], gid) : 0u;
+  uint d = (key >> pc.u[1]) & 255u;
+  uint rank = radixPrepare(d, valid);
+  if (valid) {
+    uint pos = ld(pc.a[4], d * pc.u[2] + gl_WorkGroupID.x) + sgCount[gl_SubgroupID][d] + rank;
+    st(pc.a[2], pos, key);
+    st(pc.a[3], pos, ld(pc.a[1], gid));
+  }
+}

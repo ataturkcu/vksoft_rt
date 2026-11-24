@@ -1,0 +1,63 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+layout(local_size_x = 256) in;
+// One dispatch per geometry.
+// a0 vertex base (first vertex of this range), a1 index base (0 = none),
+// a2 transform (0 = none, 3x4 row-major floats), a3 triangle output (record i),
+// a4 scene centroid bounds (ordered uints)
+// u0 primCount, u1 vertexStride, u2 indexType (0 none, 1 u16, 2 u32), u3 geometryIndex,
+// u4 geometry flags, u5 firstVertex added to indices (indexed geometry only)
+uint readIndex(uint i) {
+  uint it = pc.u[2];
+  if (it == 0u) return i;
+  if (it == 2u) return ld(pc.a[1] + uint64_t(i) * 4ul, 0u);
+  uint64_t addr = pc.a[1] + uint64_t(i) * 2ul;
+  uint w = ld(addr & ~3ul, 0u);
+  return (w >> ((uint(addr & 2ul)) * 8u)) & 0xFFFFu;
+}
+
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  bool valid = i < pc.u[0];
+  uint lo[3] = uint[3](0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu);
+  uint hi[3] = uint[3](0u, 0u, 0u);
+  if (valid) {
+    float p[9];
+    for (uint v = 0; v < 3; ++v) {
+      uint idx = (pc.u[2] == 0u) ? (i * 3u + v) : (readIndex(i * 3u + v) + pc.u[5]);
+      uint64_t addr = pc.a[0] + uint64_t(idx) * uint64_t(pc.u[1]);
+      p[v * 3 + 0] = uintBitsToFloat(ld(addr, 0u));
+      p[v * 3 + 1] = uintBitsToFloat(ld(addr, 1u));
+      p[v * 3 + 2] = uintBitsToFloat(ld(addr, 2u));
+    }
+    if (pc.a[2] != 0ul) {
+      float m[12];
+      for (uint k = 0; k < 12; ++k) m[k] = uintBitsToFloat(ld(pc.a[2], k));
+      for (uint v = 0; v < 3; ++v) {
+        float x = p[v * 3], y = p[v * 3 + 1], z = p[v * 3 + 2];
+        p[v * 3 + 0] = m[0] * x + m[1] * y + m[2] * z + m[3];
+        p[v * 3 + 1] = m[4] * x + m[5] * y + m[6] * z + m[7];
+        p[v * 3 + 2] = m[8] * x + m[9] * y + m[10] * z + m[11];
+      }
+    }
+    uint64_t outTri = pc.a[3] + uint64_t(i) * uint64_t(TRI_BYTES);
+    for (uint k = 0; k < 9; ++k) st(outTri, k, floatBitsToUint(p[k]));
+    st(outTri, 9u, pc.u[3]);
+    st(outTri, 10u, i);
+    st(outTri, 11u, pc.u[4]);
+    for (uint a = 0; a < 3; ++a) {
+      float c = (p[a] + p[3 + a] + p[6 + a]) * (1.0 / 3.0);
+      lo[a] = f2o(c);
+      hi[a] = f2o(c);
+    }
+  }
+  for (uint a = 0; a < 3; ++a) {
+    uint mn = subgroupMin(lo[a]);
+    uint mx = subgroupMax(hi[a]);
+    if (subgroupElect()) {
+      atomicMin(Words(pc.a[4]).v[a], mn);
+      atomicMax(Words(pc.a[4]).v[3 + a], mx);
+    }
+  }
+}

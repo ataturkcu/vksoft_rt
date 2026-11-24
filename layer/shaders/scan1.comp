@@ -1,0 +1,24 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+layout(local_size_x = 256) in;
+// Exclusive scan of 1024-element chunks. a0 data, a1 chunk sums; u0 = M
+shared uint sgTot[8];
+void main() {
+  uint t = gl_LocalInvocationID.x;
+  uint base = gl_WorkGroupID.x * 1024u + t * 4u;
+  uint v[4];
+  uint s = 0u;
+  for (uint k = 0; k < 4; ++k) { v[k] = (base + k < pc.u[0]) ? ld(pc.a[0], base + k) : 0u; s += v[k]; }
+  uint ex = subgroupExclusiveAdd(s);
+  if (gl_SubgroupInvocationID == 31u) sgTot[gl_SubgroupID] = ex + s;
+  barrier();
+  uint off = 0u;
+  for (uint i = 0; i < gl_SubgroupID; ++i) off += sgTot[i];
+  uint pre = off + ex;
+  for (uint k = 0; k < 4; ++k) {
+    if (base + k < pc.u[0]) st(pc.a[0], base + k, pre);
+    pre += v[k];
+  }
+  if (t == 255u) st(pc.a[1], gl_WorkGroupID.x, off + ex + s);
+}

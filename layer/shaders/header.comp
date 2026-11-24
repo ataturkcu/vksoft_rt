@@ -1,0 +1,18 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+layout(local_size_x = 1) in;
+// a0 = destination AS base; u0 = N, u1 = node region bytes, u2 = AS type (0 BLAS, 1 TLAS)
+void main() {
+  uint n = pc.u[0];
+  st(pc.a[0], 0u, 0x42534B56u);                 // 'VKSB'
+  st(pc.a[0], 1u, pc.u[2]);
+  st(pc.a[0], 2u, n);
+  st(pc.a[0], 3u, n > 0u ? n - 1u : 0u);        // internal node count
+  st(pc.a[0], 4u, n == 0u ? NONE : (n == 1u ? LEAF_BIT : 0u));  // root ref
+  st(pc.a[0], 5u, HEADER_BYTES);                // node region offset
+  st(pc.a[0], 6u, HEADER_BYTES + pc.u[1]);      // primitive region offset
+  st(pc.a[0], 7u, 1u);                          // format version
+  for (uint i = 0; i < 3; ++i) { stf(pc.a[0], 8u + i, uintBitsToFloat(0x7F800000u));
+                                  stf(pc.a[0], 11u + i, uintBitsToFloat(0xFF800000u)); }
+}

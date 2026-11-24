@@ -1,0 +1,14 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "radix_common.glsl"
+layout(local_size_x = 256) in;
+// a0 keys in, a1 histogram [digit][block]; u0 N, u1 shift, u2 numBlocks
+void main() {
+  uint gid = gl_GlobalInvocationID.x;
+  bool valid = gid < pc.u[0];
+  uint d = valid ? ((ld(pc.a[0], gid) >> pc.u[1]) & 255u) : 0u;
+  radixPrepare(d, valid);
+  uint t = gl_LocalInvocationID.x;
+  st(pc.a[1], t * pc.u[2] + gl_WorkGroupID.x, blockTotal[t]);
+}

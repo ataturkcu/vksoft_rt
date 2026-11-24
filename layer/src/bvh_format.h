@@ -52,4 +52,40 @@ constexpr uint64_t updateScratchSize(uint64_t n) {
   return alignUp(kScratchFixed + n * kUpdateScratchPerPrim, kScratchAlignment);
 }
 
+// ---- build scratch layout ---------------------------------------------------
+// Byte offsets inside the application-provided scratch buffer for a triangle BLAS build
+// over n primitives. Must always fit into buildScratchSize(n) (unit-tested).
+constexpr uint32_t kRadixBlock = 256;  // elements per radix workgroup
+constexpr uint32_t kScanChunk = 1024;  // elements per scan workgroup
+constexpr uint64_t kTriangleScratchBytes = 48;
+
+struct ScratchLayout {
+  uint64_t bounds, flags, keysA, valsA, keysB, valsB, parent, hist, chunk, tris, total;
+  uint32_t blocks;      // radix workgroups
+  uint32_t histWords;   // 256 * blocks
+  uint32_t chunkCount;  // scan chunks over the histogram
+};
+
+constexpr ScratchLayout scratchLayout(uint64_t n) {
+  ScratchLayout l{};
+  uint64_t cnt = n ? n : 1;
+  l.blocks = static_cast<uint32_t>((cnt + kRadixBlock - 1) / kRadixBlock);
+  l.histWords = 256u * l.blocks;
+  l.chunkCount = (l.histWords + kScanChunk - 1) / kScanChunk;
+  uint64_t o = 0;
+  auto take = [&](uint64_t bytes) { uint64_t at = o; o += alignUp(bytes, 16); return at; };
+  l.bounds = take(32);
+  l.flags = take(cnt * 4);
+  l.keysA = take(cnt * 4);
+  l.valsA = take(cnt * 4);
+  l.keysB = take(cnt * 4);
+  l.valsB = take(cnt * 4);
+  l.parent = take(2 * cnt * 4);
+  l.hist = take(uint64_t(l.histWords) * 4);
+  l.chunk = take(uint64_t(l.chunkCount) * 4);
+  l.tris = take(cnt * kTriangleScratchBytes);
+  l.total = o;
+  return l;
+}
+
 }  // namespace vksoft::bvh
