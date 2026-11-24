@@ -16,10 +16,32 @@ FetchContent_Declare(
   GIT_SHALLOW    TRUE)
 FetchContent_MakeAvailable(vulkan_headers)
 
+# The layer must also load inside the Steam Linux Runtime container (Proton), which has neither
+# the host's SPIRV-Tools nor a compatible libstdc++: bundle both statically by default.
+option(VKSOFT_BUNDLE_SPIRV_TOOLS "Build SPIRV-Tools into the layer and link the C++ runtime statically" ON)
+if(VKSOFT_BUNDLE_SPIRV_TOOLS)
+  set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+  set(SPIRV_SKIP_TESTS ON CACHE BOOL "" FORCE)
+  set(SPIRV_SKIP_EXECUTABLES ON CACHE BOOL "" FORCE)
+  set(SPIRV_WERROR OFF CACHE BOOL "" FORCE)
+  set(SPIRV_BUILD_FUZZER OFF CACHE BOOL "" FORCE)
+  set(SPIRV_TOOLS_BUILD_STATIC ON CACHE BOOL "" FORCE)
+  set(SKIP_SPIRV_TOOLS_INSTALL ON CACHE BOOL "" FORCE)
+  FetchContent_Declare(spirv_headers GIT_REPOSITORY https://github.com/KhronosGroup/SPIRV-Headers.git
+                       GIT_TAG vulkan-sdk-1.4.363.0 GIT_SHALLOW TRUE)
+  FetchContent_MakeAvailable(spirv_headers)
+  FetchContent_Declare(spirv_tools GIT_REPOSITORY https://github.com/KhronosGroup/SPIRV-Tools.git
+                       GIT_TAG v2026.4 GIT_SHALLOW TRUE)
+  FetchContent_MakeAvailable(spirv_tools)
+  set(SPIRV_TOOLS SPIRV-Tools-static)
+else()
+  find_library(SPIRV_TOOLS SPIRV-Tools REQUIRED)
+endif()
+
 # --- compute kernels: GLSL -> SPIR-V -> embedded C++ arrays ----------------------
 find_program(GLSLC glslc REQUIRED)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
-set(KERNELS init header fetch_tris fetch_instances morton radix_hist radix_scatter scan1 scan2 scan3 karras refit)
+set(KERNELS init header fetch_tris fetch_aabbs fetch_instances morton radix_hist radix_scatter scan1 scan2 scan3 karras refit)
 set(LIBRARY_KERNELS rq_lib)  # compiled -O0: glslang/spirv-opt would drop what the rewriter copies
 set(KERNEL_GEN_DIR ${CMAKE_BINARY_DIR}/generated)
 file(MAKE_DIRECTORY ${KERNEL_GEN_DIR})
@@ -53,13 +75,15 @@ add_custom_command(
   DEPENDS ${KERNEL_SPVS} tools/embed_spv.py
   COMMENT "embedding SPIR-V kernels")
 
-find_library(SPIRV_TOOLS SPIRV-Tools REQUIRED)
 add_library(VkLayer_vksoft_rt SHARED layer/src/layer.cpp layer/src/accel_build.cpp layer/src/rq_rewrite.cpp
             layer/src/descriptor_cells.cpp ${KERNEL_GEN_DIR}/kernels_spv.h)
 target_include_directories(VkLayer_vksoft_rt PRIVATE ${KERNEL_GEN_DIR})
 target_link_libraries(VkLayer_vksoft_rt PRIVATE Vulkan::Headers ${SPIRV_TOOLS})
 target_compile_options(VkLayer_vksoft_rt PRIVATE -Wall -Wextra -Wpedantic -Wno-missing-field-initializers)
 target_link_options(VkLayer_vksoft_rt PRIVATE -Wl,--no-undefined)
+if(VKSOFT_BUNDLE_SPIRV_TOOLS)
+  target_link_options(VkLayer_vksoft_rt PRIVATE -static-libstdc++ -static-libgcc)
+endif()
 
 # Layer manifest next to the library so VK_ADD_LAYER_PATH=<build dir> works.
 configure_file(layer/VkLayer_vksoft_rt.json.in
@@ -73,14 +97,19 @@ add_test(NAME bvh_sizes COMMAND test_bvh_sizes)
 
 # --- ray query rewriter test (host only) ----------------------------------------
 set(RQ_TEST_SPVS)
-foreach(spec rq_test:-O0 rq_test_opt:-O rq_two:-O0 rq_two_opt:-O rq_param:-O0 plain:-O0)
+foreach(spec rq_test:-O0 rq_test_opt:-O rq_two:-O0 rq_two_opt:-O rq_param:-O0 plain:-O0 rq_aabb:-O rq_array0:-O rq_array1:-O)
   string(REPLACE ":" ";" parts ${spec})
   list(GET parts 0 sname)
   list(GET parts 1 sopt)
   string(REGEX REPLACE "_opt$" "" ssrc ${sname})
+  set(sdefs)
+  if(sname MATCHES "^rq_array([01])$")
+    set(ssrc rq_array)
+    set(sdefs -DTLAS_INDEX=${CMAKE_MATCH_1})
+  endif()
   add_custom_command(
     OUTPUT ${KERNEL_GEN_DIR}/${sname}.spv
-    COMMAND ${GLSLC} --target-env=vulkan1.2 ${sopt} -o ${KERNEL_GEN_DIR}/${sname}.spv
+    COMMAND ${GLSLC} --target-env=vulkan1.2 ${sopt} ${sdefs} -o ${KERNEL_GEN_DIR}/${sname}.spv
             ${CMAKE_SOURCE_DIR}/tests/shaders/${ssrc}.comp
     DEPENDS tests/shaders/${ssrc}.comp
     COMMENT "glslc ${ssrc}.comp -> ${sname}.spv")
@@ -115,10 +144,14 @@ if(VULKAN_LOADER)
   target_compile_definitions(rq_test PRIVATE TEST_SPV_DIR="${KERNEL_GEN_DIR}")
   target_link_libraries(rq_test PRIVATE Vulkan::Headers ${VULKAN_LOADER})
   add_test(NAME rq_test COMMAND rq_test)
+  add_executable(aabb_test tests/aabb_test.cpp ${RQ_TEST_SPVS})
+  target_compile_definitions(aabb_test PRIVATE TEST_SPV_DIR="${KERNEL_GEN_DIR}")
+  target_link_libraries(aabb_test PRIVATE Vulkan::Headers ${VULKAN_LOADER})
+  add_test(NAME aabb_test COMMAND aabb_test)
   add_executable(tlas_build tests/tlas_build.cpp)
   target_link_libraries(tlas_build PRIVATE Vulkan::Headers ${VULKAN_LOADER})
   add_test(NAME tlas_build COMMAND tlas_build)
   add_test(NAME as_lifecycle COMMAND as_lifecycle)
-  set_tests_properties(as_lifecycle blas_build tlas_build trace_test rq_test PROPERTIES
+  set_tests_properties(as_lifecycle blas_build tlas_build trace_test rq_test aabb_test PROPERTIES
     ENVIRONMENT "VK_ADD_LAYER_PATH=${CMAKE_BINARY_DIR};VK_LOADER_LAYERS_ENABLE=VK_LAYER_VKSOFT_rt;VKSOFT_RT_LOG=1")
 endif()

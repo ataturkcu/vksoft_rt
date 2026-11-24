@@ -18,9 +18,19 @@ void main() {
   vec3 c = vec3(0);
   if (pc.u[1] == 0u) {
     uint64_t t = pc.a[0] + uint64_t(i) * uint64_t(TRI_BYTES);
-    for (uint v = 0; v < 3; ++v)
-      c += vec3(ldf(t, v * 3), ldf(t, v * 3 + 1), ldf(t, v * 3 + 2));
-    c *= (1.0 / 3.0);
+    if ((ld(t, 11u) & 2u) != 0u) {  // procedural leaf: box in words 0..5, empty boxes sort last
+      vec3 bmn = vec3(ldf(t, 0), ldf(t, 1), ldf(t, 2)), bmx = vec3(ldf(t, 3), ldf(t, 4), ldf(t, 5));
+      if (bmn.x > bmx.x) {
+        st(pc.a[2], i, 0xFFFFFFFFu);
+        st(pc.a[3], i, i);
+        return;
+      }
+      c = 0.5 * (bmn + bmx);
+    } else {
+      for (uint v = 0; v < 3; ++v)
+        c += vec3(ldf(t, v * 3), ldf(t, v * 3 + 1), ldf(t, v * 3 + 2));
+      c *= (1.0 / 3.0);
+    }
   } else {
     uint64_t t = pc.a[0] + uint64_t(i) * 24ul;
     vec3 bmn = vec3(ldf(t, 0), ldf(t, 1), ldf(t, 2)), bmx = vec3(ldf(t, 3), ldf(t, 4), ldf(t, 5));

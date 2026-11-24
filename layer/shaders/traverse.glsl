@@ -25,7 +25,8 @@ struct HitInfo {
   uint primitiveIndex;
   bool frontFace;
   uint64_t instRecord;  // address of the TLAS instance record (transforms, ids)
-  uint kind;            // 0 none, 1 triangle
+  uint kind;            // 0 none, 1 triangle, 2 procedural (AABB)
+  bool opaque;          // candidates: effective opacity of the primitive
 };
 
 struct Trav {
@@ -54,7 +55,7 @@ HitInfo noHit() {
   h.t = 0.0; h.u = 0.0; h.v = 0.0;
   h.instanceIndex = 0u; h.customIndex = 0u; h.sbtOffset = 0u;
   h.geometryIndex = 0u; h.primitiveIndex = 0u; h.frontFace = false;
-  h.instRecord = 0ul; h.kind = 0u;
+  h.instRecord = 0ul; h.kind = 0u; h.opaque = false;
   return h;
 }
 
@@ -140,6 +141,45 @@ void rayCommit(inout Trav s, HitInfo h) {
   if ((s.flags & RF_TERMINATE_FIRST) != 0u) s.done = true;
 }
 
+// Procedural (AABB) leaf. A ray query always gets a candidate for a box the ray overlaps; the
+// application intersects its own geometry and calls rayQueryGenerateIntersection.
+bool processProcedural(inout Trav s, uint64_t rec) {
+  if ((s.flags & RF_SKIP_AABBS) != 0u) return false;
+  bool opaque = (ld(rec, 11u) & 1u) != 0u;
+  if (s.inBlas) {
+    if ((s.instFlags & IF_FORCE_OPAQUE) != 0u) opaque = true;
+    else if ((s.instFlags & IF_FORCE_NO_OPAQUE) != 0u) opaque = false;
+  }
+  if ((s.flags & RF_OPAQUE) != 0u) opaque = true;
+  else if ((s.flags & RF_NO_OPAQUE) != 0u) opaque = false;
+  if (opaque && (s.flags & RF_CULL_OPAQUE) != 0u) return false;
+  if (!opaque && (s.flags & RF_CULL_NO_OPAQUE) != 0u) return false;
+
+  vec3 mn = vec3(ldf(rec, 0u), ldf(rec, 1u), ldf(rec, 2u));
+  vec3 mx = vec3(ldf(rec, 3u), ldf(rec, 4u), ldf(rec, 5u));
+  vec3 lo = vec3(s.inv.x >= 0.0 ? mn.x : mx.x, s.inv.y >= 0.0 ? mn.y : mx.y, s.inv.z >= 0.0 ? mn.z : mx.z);
+  vec3 hi = vec3(s.inv.x >= 0.0 ? mx.x : mn.x, s.inv.y >= 0.0 ? mx.y : mn.y, s.inv.z >= 0.0 ? mx.z : mn.z);
+  vec3 t0 = (lo - s.o) * s.inv;
+  vec3 t1 = (hi - s.o) * s.inv;
+  float tn = max(max(t0.x, t0.y), max(t0.z, s.tmin));
+  float tf = min(min(t1.x, t1.y), min(t1.z, s.limit));
+  if (!(tn <= tf * 1.0000004)) return false;
+
+  HitInfo h;
+  h.t = tn; h.u = 0.0; h.v = 0.0;
+  h.instanceIndex = ld(s.instRec, 28u);
+  h.customIndex = ld(s.instRec, 24u) & 0xFFFFFFu;
+  h.sbtOffset = ld(s.instRec, 25u) & 0xFFFFFFu;
+  h.geometryIndex = ld(rec, 9u);
+  h.primitiveIndex = ld(rec, 10u);
+  h.frontFace = false;
+  h.instRecord = s.instRec;
+  h.kind = 2u;
+  h.opaque = opaque;
+  s.cand = h;
+  return true;
+}
+
 // Triangle leaf. Returns true when a non-opaque candidate was recorded (caller decides).
 bool processTriangle(inout Trav s, uint64_t tri) {
   if ((s.flags & RF_SKIP_TRIANGLES) != 0u) return false;
@@ -177,6 +217,7 @@ bool processTriangle(inout Trav s, uint64_t tri) {
   h.frontFace = front;
   h.instRecord = s.instRec;
   h.kind = 1u;
+  h.opaque = opaque;
   if (opaque) { rayCommit(s, h); return false; }
   s.cand = h;
   return true;
@@ -241,11 +282,26 @@ bool rayProceed(inout Trav s, uint64_t tlasBase) {
       s.cur = root;
       continue;
     }
-    if (processTriangle(s, s.primBase + uint64_t(k) * 48ul)) return true;
+    uint64_t leafRec = s.primBase + uint64_t(k) * 48ul;
+    if ((ld(leafRec, 11u) & 2u) != 0u) {
+      if (processProcedural(s, leafRec)) return true;
+    } else if (processTriangle(s, leafRec)) {
+      return true;
+    }
   }
   return false;
 }
 
+// Only triangle candidates can be confirmed; procedural ones need rayGenerateIntersection.
 void rayConfirmCandidate(inout Trav s) {
-  if (s.cand.kind != 0u) { rayCommit(s, s.cand); s.cand.kind = 0u; }
+  if (s.cand.kind == 1u) { rayCommit(s, s.cand); s.cand.kind = 0u; }
+}
+
+void rayGenerateIntersection(inout Trav s, float tHit) {
+  if (s.cand.kind == 2u && tHit >= s.tmin && (s.strict ? tHit < s.limit : tHit <= s.limit)) {
+    HitInfo h = s.cand;
+    h.t = tHit;
+    rayCommit(s, h);
+  }
+  s.cand.kind = 0u;
 }

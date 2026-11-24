@@ -34,7 +34,7 @@ bool vk_rq_proceed(uint slot) {
 
 void vk_rq_terminate(uint slot) { gRQ[slot].t.done = true; }
 void vk_rq_confirmIntersection(uint slot) { Trav t = gRQ[slot].t; rayConfirmCandidate(t); gRQ[slot].t = t; }
-void vk_rq_generateIntersection(uint slot, float tHit) { /* AABB geometry not supported yet */ }
+void vk_rq_generateIntersection(uint slot, float tHit) { Trav t = gRQ[slot].t; rayGenerateIntersection(t, tHit); gRQ[slot].t = t; }
 
 HitInfo vk_rq_hit(uint slot, int committed) {
   return committed != 0 ? gRQ[slot].t.committed : gRQ[slot].t.cand;
@@ -42,7 +42,7 @@ HitInfo vk_rq_hit(uint slot, int committed) {
 
 uint vk_rq_getIntersectionType(uint slot, int committed) {
   // committed: 0 none, 1 triangle, 2 generated (AABB); candidate: 0 triangle, 1 AABB
-  return committed != 0 ? (gRQ[slot].t.committed.kind == 1u ? 1u : 0u) : 0u;
+  return committed != 0 ? gRQ[slot].t.committed.kind : (gRQ[slot].t.cand.kind == 2u ? 1u : 0u);
 }
 float vk_rq_getIntersectionT(uint slot, int committed) { return vk_rq_hit(slot, committed).t; }
 int vk_rq_getIntersectionInstanceCustomIndex(uint slot, int committed) { return int(vk_rq_hit(slot, committed).customIndex); }
@@ -52,7 +52,7 @@ int vk_rq_getIntersectionGeometryIndex(uint slot, int committed) { return int(vk
 int vk_rq_getIntersectionPrimitiveIndex(uint slot, int committed) { return int(vk_rq_hit(slot, committed).primitiveIndex); }
 vec2 vk_rq_getIntersectionBarycentrics(uint slot, int committed) { HitInfo h = vk_rq_hit(slot, committed); return vec2(h.u, h.v); }
 bool vk_rq_getIntersectionFrontFace(uint slot, int committed) { return vk_rq_hit(slot, committed).frontFace; }
-bool vk_rq_getIntersectionCandidateAABBOpaque(uint slot) { return false; }
+bool vk_rq_getIntersectionCandidateAABBOpaque(uint slot) { return gRQ[slot].t.cand.opaque; }
 
 float vk_rq_getRayTMin(uint slot) { return gRQ[slot].rayTMin; }
 uint vk_rq_getRayFlags(uint slot) { return gRQ[slot].rayFlags; }

@@ -168,7 +168,8 @@ RayBatch makeRays(const Scene& sc, std::mt19937& rng, uint32_t R) {
       for (int a = 0; a < 3; ++a) r.d[a] = (t.v[0][a] + t.v[1][a] + t.v[2][a]) / 3.0 + J(rng) - r.o[a];
     } else if (kind < 56) {
       static const double axes[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
-      for (int a = 0; a < 3; ++a) r.d[a] = axes[rng() % 6][a];
+      const uint32_t axis = rng() % 6;  // one axis for all components (a per-component pick can give a zero vector)
+      for (int a = 0; a < 3; ++a) r.d[a] = axes[axis][a];
     } else {
       for (int a = 0; a < 3; ++a) r.d[a] = D(rng);
     }

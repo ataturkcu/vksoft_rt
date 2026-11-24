@@ -284,11 +284,18 @@ bool Rewriter::run(const uint32_t* code, size_t words, std::vector<uint32_t>& ou
   std::unordered_set<uint32_t> removedTypes, rqVars, asVars;
   if (rqType) removedTypes.insert(rqType);
   if (asType) removedTypes.insert(asType);
-  for (auto& g : app.globals)
+  std::map<uint32_t, std::string> asArrayLen;  // array-of-AS type id -> length operand
+  for (auto& g : app.globals) {
+    if (g.op == "OpTypeArray" && g.args.size() >= 2 && asType && g.args[0] == idStr(asType)) {
+      removedTypes.insert(g.result);
+      asArrayLen[g.result] = g.args[1];
+    }
     if (g.op == "OpTypePointer" && g.args.size() >= 2 && isId(g.args[1]) && removedTypes.count(idNum(g.args[1])))
       removedTypes.insert(g.result);
+  }
   for (auto& g : app.globals) {
     if (g.op == "OpTypeRayQueryKHR" || g.op == "OpTypeAccelerationStructureKHR") continue;
+    if (asArrayLen.count(g.result)) continue;
     if (g.op == "OpTypePointer" && removedTypes.count(g.result)) continue;
     if (g.op == "OpVariable" && !g.args.empty() && removedTypes.count(idNum(g.args[0]))) continue;
     for (auto& a : g.args)
@@ -296,6 +303,7 @@ bool Rewriter::run(const uint32_t* code, size_t words, std::vector<uint32_t>& ou
         return fail("unsupported use of ray query / acceleration structure type in " + g.op);
   }
   std::map<uint32_t, uint32_t> slotOf;  // rq variable id -> slot
+  std::map<uint32_t, uint32_t> asArrayVars;  // AS array variable -> its array type
   auto scanVars = [&](const std::vector<Inst>& v) {
     for (auto& in : v) {
       if (in.op != "OpVariable" || in.args.empty()) continue;
@@ -307,6 +315,7 @@ bool Rewriter::run(const uint32_t* code, size_t words, std::vector<uint32_t>& ou
           uint32_t pointee = idNum(g.args[1]);
           if (pointee == rqType) { rqVars.insert(in.result); if (!slotOf.count(in.result)) { uint32_t s = uint32_t(slotOf.size()); slotOf[in.result] = s; } }
           if (pointee == asType) asVars.insert(in.result);
+          if (asArrayLen.count(pointee)) { asArrayVars[in.result] = pointee; }
         }
     }
   };
@@ -335,6 +344,7 @@ bool Rewriter::run(const uint32_t* code, size_t words, std::vector<uint32_t>& ou
   std::vector<Inst> appGlobals;
   for (auto& g0 : app.globals) {
     if (g0.op == "OpTypeRayQueryKHR" || g0.op == "OpTypeAccelerationStructureKHR") continue;
+    if (asArrayLen.count(g0.result)) continue;
     if (g0.op == "OpTypePointer" && removedTypes.count(g0.result)) continue;
     if (g0.op == "OpVariable" && !g0.args.empty() && removedTypes.count(idNum(g0.args[0]))) continue;
     Inst g = g0;
@@ -357,7 +367,7 @@ bool Rewriter::run(const uint32_t* code, size_t words, std::vector<uint32_t>& ou
   uint32_t c1 = intern("OpConstant", {idStr(uintT), "1"});
   uint32_t asBlock = 0, ptrSBBlock = 0, ptrSBUint = 0;
   std::vector<Inst> newAnnots;
-  if (!asVars.empty()) {
+  if (!asVars.empty() || !asArrayVars.empty()) {
     asBlock = fresh();
     libDecl.push_back({asBlock, "OpTypeStruct", {idStr(uintT), idStr(uintT)}});
     newAnnots.push_back({0, "OpDecorate", {idStr(asBlock), "Block"}});
@@ -368,6 +378,20 @@ bool Rewriter::run(const uint32_t* code, size_t words, std::vector<uint32_t>& ou
     ptrSBBlock = intern("OpTypePointer", {"StorageBuffer", idStr(asBlock)});
     ptrSBUint = intern("OpTypePointer", {"StorageBuffer", idStr(uintT)});
     for (uint32_t v : asVars) appGlobals.push_back({v, "OpVariable", {idStr(ptrSBBlock), "StorageBuffer"}});
+    // arrays: declared after the application's constants (the length is one of them)
+    std::map<std::string, uint32_t> arrayPtrByLen;
+    for (auto& [var, arrType] : asArrayVars) {
+      std::string len = asArrayLen[arrType];
+      if (isId(len)) { auto it = sub.find(idNum(len)); if (it != sub.end()) len = idStr(it->second); }
+      auto pit = arrayPtrByLen.find(len);
+      if (pit == arrayPtrByLen.end()) {
+        uint32_t arr = fresh(), ptr = fresh();
+        appGlobals.push_back({arr, "OpTypeArray", {idStr(asBlock), len}});
+        appGlobals.push_back({ptr, "OpTypePointer", {"StorageBuffer", idStr(arr)}});
+        pit = arrayPtrByLen.emplace(len, ptr).first;
+      }
+      appGlobals.push_back({var, "OpVariable", {idStr(pit->second), "StorageBuffer"}});
+    }
   }
 
   // ---- library functions: copied verbatim (renumbered) ------------------------------------
@@ -413,6 +437,7 @@ bool Rewriter::run(const uint32_t* code, size_t words, std::vector<uint32_t>& ou
     n[0] = static_cast<char>(std::tolower(static_cast<unsigned char>(n[0])));
     return "vk_rq_" + n;
   };
+  std::unordered_set<uint32_t> asPtrs;  // access chain results pointing at acceleration structure address blocks
   std::vector<Inst> hoisted;  // temporaries for by-pointer arguments, placed at the top of the function
   size_t labelPos = 0;
   bool seenLabel = false;
@@ -434,7 +459,15 @@ bool Rewriter::run(const uint32_t* code, size_t words, std::vector<uint32_t>& ou
       continue;
     }
     if (in.op == "OpVariable" && !in.args.empty() && removedTypes.count(idNum(in.args[0]))) continue;
-    if (in.op == "OpLoad" && in.args.size() >= 2 && asType && isId(in.args[1]) && asVars.count(idNum(in.args[1]))) {
+    if ((in.op == "OpAccessChain" || in.op == "OpInBoundsAccessChain") && in.args.size() >= 3 && isId(in.args[1]) &&
+        asArrayVars.count(idNum(in.args[1])) && removedTypes.count(idNum(in.args[0]))) {
+      in.args[0] = idStr(ptrSBBlock);  // pointer to one acceleration structure -> pointer to its address block
+      asPtrs.insert(in.result);
+      appFuncs.push_back(in);
+      continue;
+    }
+    if (in.op == "OpLoad" && in.args.size() >= 2 && asType && isId(in.args[1]) &&
+        (asVars.count(idNum(in.args[1])) || asPtrs.count(idNum(in.args[1])))) {
       uint32_t p0 = fresh(), p1 = fresh(), lo = fresh(), hi = fresh(), pair = fresh();
       appFuncs.push_back({p0, "OpAccessChain", {idStr(ptrSBUint), in.args[1], idStr(c0)}});
       appFuncs.push_back({p1, "OpAccessChain", {idStr(ptrSBUint), in.args[1], idStr(c1)}});

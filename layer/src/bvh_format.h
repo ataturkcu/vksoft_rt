@@ -16,7 +16,7 @@ constexpr uint64_t kScratchAlignment = 256; // >= minAccelerationStructureScratc
 constexpr uint64_t kHeaderBytes = 128;      // AS header: magic, type, counts, root, bounds
 constexpr uint64_t kNodeBytes = 64;         // wide (BVH4) node with quantized child boxes
 constexpr uint64_t kTrianglePrimBytes = 48; // 3 x vec3 + geometry/primitive ids
-constexpr uint64_t kAabbPrimBytes = 32;     // aabb + geometry/primitive ids
+constexpr uint64_t kAabbPrimBytes = 48;     // box leaf record, same stride as a triangle (flags bit1 = procedural)
 constexpr uint64_t kInstanceBytes = 128;    // TLAS leaf record, see below
 // TLAS instance record (32 words): [0..11] objectToWorld 3x4 row-major, [12..23]
 // worldToObject 3x4, [24] customIndex(24)|mask(8)<<24, [25] sbtOffset(24)|flags(8)<<24,

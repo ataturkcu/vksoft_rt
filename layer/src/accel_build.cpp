@@ -23,13 +23,13 @@ namespace {
 using namespace bvh;
 
 enum Kernel {
-  K_INIT, K_HEADER, K_FETCH, K_FETCH_INST, K_MORTON, K_HIST, K_SCATTER, K_SCAN1, K_SCAN2, K_SCAN3,
+  K_INIT, K_HEADER, K_FETCH, K_FETCH_AABB, K_FETCH_INST, K_MORTON, K_HIST, K_SCATTER, K_SCAN1, K_SCAN2, K_SCAN3,
   K_KARRAS, K_REFIT, K_COUNT
 };
 
 struct SpvRef { const uint32_t* data; size_t bytes; };
 #define SPV(n) SpvRef{k_##n##_spv, sizeof(k_##n##_spv)}
-const SpvRef kSpv[K_COUNT] = {SPV(init), SPV(header), SPV(fetch_tris), SPV(fetch_instances), SPV(morton), SPV(radix_hist),
+const SpvRef kSpv[K_COUNT] = {SPV(init), SPV(header), SPV(fetch_tris), SPV(fetch_aabbs), SPV(fetch_instances), SPV(morton), SPV(radix_hist),
                               SPV(radix_scatter), SPV(scan1), SPV(scan2), SPV(scan3), SPV(karras),
                               SPV(refit)};
 #undef SPV
@@ -173,11 +173,16 @@ bool recordBuild(BuildKernels* k, VkCommandBuffer cb, const VkAccelerationStruct
     }
     n = ranges[0].primitiveCount;
   } else {
+    const VkGeometryTypeKHR blasType = (info.pGeometries ? info.pGeometries[0] : *info.ppGeometries[0]).geometryType;
     for (uint32_t g = 0; g < info.geometryCount; ++g) {
       const auto& geo = info.pGeometries ? info.pGeometries[g] : *info.ppGeometries[g];
-      if (geo.geometryType != VK_GEOMETRY_TYPE_TRIANGLES_KHR) {
-        LOGF("build: only triangle geometry is implemented (geometry %u)", g);
+      if (geo.geometryType != blasType || (blasType != VK_GEOMETRY_TYPE_TRIANGLES_KHR && blasType != VK_GEOMETRY_TYPE_AABBS_KHR)) {
+        LOGF("build: a BLAS needs triangle or AABB geometry, all of one type (geometry %u)", g);
         return false;
+      }
+      if (geo.geometryType == VK_GEOMETRY_TYPE_AABBS_KHR) {
+        n += ranges[g].primitiveCount;
+        continue;
       }
       if (geo.geometry.triangles.vertexFormat != VK_FORMAT_R32G32B32_SFLOAT) {
         LOGF("build: only R32G32B32_SFLOAT vertices are implemented (format %d)",
@@ -231,6 +236,20 @@ bool recordBuild(BuildKernels* k, VkCommandBuffer cb, const VkAccelerationStruct
     uint64_t primBase = 0;
     for (uint32_t g = 0; g < info.geometryCount; ++g) {
       const auto& geo = info.pGeometries ? info.pGeometries[g] : *info.ppGeometries[g];
+      if (geo.geometryType == VK_GEOMETRY_TYPE_AABBS_KHR) {
+        const auto& ab = geo.geometry.aabbs;
+        pc = {};
+        pc.a[0] = ab.data.deviceAddress + ranges[g].primitiveOffset;
+        pc.a[3] = scratch + L.tris + primBase * kTriangleScratchBytes;
+        pc.a[4] = scratch + L.bounds;
+        pc.u[0] = ranges[g].primitiveCount;
+        pc.u[1] = static_cast<uint32_t>(ab.stride);
+        pc.u[3] = g;
+        pc.u[4] = (geo.flags & VK_GEOMETRY_OPAQUE_BIT_KHR) ? 1u : 0u;
+        dispatch(k, cb, K_FETCH_AABB, pc, groups256(ranges[g].primitiveCount));
+        primBase += ranges[g].primitiveCount;
+        continue;
+      }
       const auto& tri = geo.geometry.triangles;
       const auto& r = ranges[g];
       pc = {};

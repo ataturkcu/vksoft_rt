@@ -238,9 +238,25 @@ state is copied in and out of the slot array on every proceed/confirm, the libra
 optimised, and each argument goes through a temporary. To be fixed in M3 together with the
 traversal itself.
 
+### 4.3b2 Procedural geometry and AS arrays (implemented for Quake II RTX)
+- **AABB geometry**: BLAS builds accept `VK_GEOMETRY_TYPE_AABBS_KHR` (a BLAS holds one geometry
+  type). Boxes become leaf records with the same 48-byte stride as triangles (flags bit1 =
+  procedural, bit0 = opaque); inactive boxes (min > max or NaN) get empty boxes and sort last.
+- **Traversal**: a procedural leaf gives the ray query a *candidate* for any box the ray overlaps
+  (opaque or not, as the spec requires); `rayQueryGenerateIntersection` commits it
+  (committed type 2), `rayQueryConfirmIntersection` ignores procedural candidates. The
+  candidate's effective opacity is available through `rayQueryGetIntersectionCandidateAABBOpaque`.
+- **Arrays of acceleration structures** (`accelerationStructureEXT scenes[N]`): the variable
+  becomes an array of address blocks, constant-indexed access chains are rewritten to point at
+  one block, and descriptors/templates carry N entries.
+- `tests/aabb_test.cpp` (6 flag modes vs. a double precision reference) and the array tests in
+  `tests/rq_test.cpp` cover these. While writing them a bug in the ray generator of the tests
+  turned up (zero direction vectors for "axis aligned" rays, which the reference silently
+  treated as misses): fixed, real axis-aligned rays are now tested.
+
 ### 4.3c Open items of the ray query path
-Not implemented: procedural (AABB) candidates, `GenerateIntersection`, triangle vertex
-position fetch, descriptor buffers, queries as function arguments.
+Not implemented: triangle vertex position fetch, descriptor buffers, dynamic (non-constant)
+indexing of acceleration structure arrays with `NonUniform`, queries as function arguments.
 
 ### 4.3d Ray tracing pipelines and vkd3d-proton
 Next milestones; see section 5.
@@ -299,7 +315,7 @@ Source: github.com/NVIDIA/Q2RTX, `src/refresh/vkpt`. Findings that drive the pla
 | M  | Content | Validation |
 |----|---------|------------|
 | M0 | Layer skeleton, dispatch, ray_query advertisement | `vulkaninfo` shows ray_query *(done)* |
-| M1 | AS build/update/copy, own BVH; `ray_query` via SPIR-V rewrite (done: object model, sizes, triangle BLAS/TLAS builds, traversal library, ray_query SPIR-V rewrite + descriptors; later: AABB geometry, copy/compact, descriptor templates / push descriptors) | Khronos ray-query samples, Vulkan CTS RT tests, Sponza |
+| M1 | AS build/update/copy, own BVH; `ray_query` via SPIR-V rewrite (done: object model, sizes, triangle + AABB BLAS and TLAS builds, traversal library, ray_query SPIR-V rewrite, descriptors incl. templates / push / arrays; later: copy/compact) | Khronos ray-query samples, Vulkan CTS RT tests, Sponza |
 | M2 | RT pipeline megakernel | Quake II RTX, compare against driver emulation |
 | M3 | Performance: wide/quantized BVH, refit, async build, coherence | Frame-time benchmarks vs. M2 and vs. driver |
 | M4 | DXR games via vkd3d-proton / Proton | RT-required titles |
@@ -316,10 +332,17 @@ Source: github.com/NVIDIA/Q2RTX, `src/refresh/vkpt`. Findings that drive the pla
 - Advertising features that are not implemented is dangerous: until M1 the layer is
   explicit-only (`VK_LOADER_LAYERS_ENABLE=VK_LAYER_VKSOFT_rt`), never an implicit layer.
 
+## 6b. Running with Steam / Proton
+
+The layer is self-contained: SPIRV-Tools is built in statically and the C++ runtime is linked
+statically (`VKSOFT_BUNDLE_SPIRV_TOOLS`, default ON), so the .so only needs glibc (max symbol
+version GLIBC_2.38). Steam's container runtimes may ship an older Vulkan loader, therefore the
+legacy variables are the portable way to enable an explicit layer (see README).
+
 ## 7. Developing
 
 Tests: `ctest --test-dir build --output-on-failure` (`bvh_sizes` is pure host code;
-`as_lifecycle`, `blas_build`, `tlas_build`, `trace_test` and `rq_test` run through the layer on the real GPU). Building needs
+`as_lifecycle`, `blas_build`, `tlas_build`, `trace_test`, `rq_test` and `aabb_test` run through the layer on the real GPU). Building needs
 `glslc`, Python 3 and SPIRV-Tools (libSPIRV-Tools).
 
 ```

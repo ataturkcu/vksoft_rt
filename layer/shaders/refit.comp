@@ -16,10 +16,14 @@ void main() {
   if (pc.u[1] == 0u) {
     uint64_t tri = pc.a[2] + uint64_t(src) * uint64_t(TRI_BYTES);
     for (uint w = 0; w < TRI_WORDS; ++w) st(dst, w, ld(tri, w));
-    for (uint a = 0; a < 3; ++a) {
-      float x = ldf(tri, a), y = ldf(tri, 3 + a), z = ldf(tri, 6 + a);
-      b[a] = min(x, min(y, z));
-      b[3 + a] = max(x, max(y, z));
+    if ((ld(tri, 11u) & 2u) != 0u) {  // procedural leaf: the record holds the box (maybe empty)
+      for (uint a = 0; a < 3; ++a) { b[a] = ldf(tri, a); b[3 + a] = ldf(tri, 3 + a); }
+    } else {
+      for (uint a = 0; a < 3; ++a) {
+        float x = ldf(tri, a), y = ldf(tri, 3 + a), z = ldf(tri, 6 + a);
+        b[a] = min(x, min(y, z));
+        b[3 + a] = max(x, max(y, z));
+      }
     }
   } else {
     uint64_t rec = pc.a[2] + uint64_t(src) * 24ul;
