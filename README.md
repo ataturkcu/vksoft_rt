@@ -1,1 +1,15 @@
-software based ray tracing layer for vulkan 1.2+ supported gpus
+# vksoft_rt
+
+Software based ray tracing layer for Vulkan 1.2+ GPUs without dedicated RT cores.
+
+Primary target: NVIDIA on Linux.
+
+Status: M0 (layer skeleton, `VK_KHR_ray_query` advertisement only). See
+[docs/design.md](docs/design.md).
+
+```
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build
+VK_ADD_LAYER_PATH=$PWD/build VK_LOADER_LAYERS_ENABLE=VK_LAYER_VKSOFT_rt vulkaninfo | grep -i ray_query
+```
+
+The layer is explicit (opt-in) on purpose: it advertises features it does not implement yet.
