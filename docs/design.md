@@ -268,6 +268,32 @@ checkerboard/sparse dispatch with reconstruction, distance culling in the TLAS, 
 These change semantics (the game's denoiser expects its own ray pattern) and need to know
 which images are outputs, so they are **research items**, off by default, per-game profiles.
 
+## 4.9 Target analysis: Quake II RTX (read from its open source, no code run)
+
+Source: github.com/NVIDIA/Q2RTX, `src/refresh/vkpt`. Findings that drive the plan:
+
+- **It has two ray tracing back ends**, chosen by the `ray_tracing_api` cvar
+  (`auto`/`query`/`pipeline`). `query` compiles every ray generation shader as a *compute* shader
+  (`-DKHR_RAY_QUERY`) using `GL_EXT_ray_query`. With `auto` on the proprietary NVIDIA driver it
+  *prefers* ray query when the device exposes it. Our layer advertises `ray_query`, so the
+  existing ray query path is enough to run the game, **without the pipeline megakernel**.
+- The pipeline back end is the baseline we must beat: on the 1660 Ti the driver's own
+  emulation is what the measured 13/20/30 fps (1080p/900p/720p) come from. Setting
+  `ray_tracing_api pipeline` vs `query` gives an exact apples-to-apples comparison in the same
+  game and scene.
+- Pipeline back end details (for the later megakernel): `maxPipelineRayRecursionDepth = 1`,
+  one raygen per pipeline, a closest-hit, a miss, five any-hit shaders (masked, particle,
+  explosion, sprite, beam), one intersection shader (beams); hit groups are selected through
+  the instance SBT offset, `sbtRecordStride = 0`.
+- AS API surface used: triangle BLAS (`R32G32B32_SFLOAT`, index none or u16), **AABB BLAS**
+  (beams), TLAS with instance flags FORCE_OPAQUE / FORCE_NO_OPAQUE / FACING_CULL_DISABLE /
+  FRONT_COUNTERCLOCKWISE, build flags PREFER_FAST_BUILD / PREFER_FAST_TRACE. No update, copy
+  or compaction.
+- What the ray query path needs that we do not have yet: (1) **arrays of acceleration
+  structures** in shaders and descriptors (`topLevelAS[2]`: geometry + effects), (2) **AABB
+  geometry** in BLAS builds, procedural *candidates* in traversal and
+  `rayQueryGenerateIntersectionEXT`.
+
 ## 5. Milestones
 
 | M  | Content | Validation |
